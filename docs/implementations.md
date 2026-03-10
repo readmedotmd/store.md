@@ -65,25 +65,28 @@ CREATE TABLE IF NOT EXISTS kv_store (
 
 ## S3 — `s3/`
 
-Uses AWS SDK v2 with any S3-compatible backend (AWS S3, MinIO, R2, etc).
+Uses [MinIO Go client](https://pkg.go.dev/github.com/minio/minio-go/v7) with any S3-compatible backend (AWS S3, MinIO, R2, etc).
 
 ```go
 import (
-    "github.com/aws/aws-sdk-go-v2/aws"
-    "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/minio/minio-go/v7"
+    "github.com/minio/minio-go/v7/pkg/credentials"
 
     s3store "github.com/readmedotmd/store.md/s3"
 )
 
-client := s3.NewFromConfig(cfg)
+client, _ := minio.New("s3.amazonaws.com", &minio.Options{
+    Creds:  credentials.NewStaticV4("ACCESS_KEY", "SECRET_KEY", ""),
+    Secure: true,
+})
 store := s3store.New(client, "my-bucket", "optional/prefix/")
 ```
 
-Values are stored as object contents. `List` uses `ListObjectsV2` and fetches each value individually.
+Values are stored as object contents. `List` uses `ListObjects` and fetches each value individually.
 
 **Best for:** Serverless, cloud-native, large values, cross-region storage.
 
-**Note:** `Delete` performs a `HeadObject` check first since S3's `DeleteObject` doesn't error on missing keys.
+**Note:** `Delete` performs a `StatObject` check first since S3's `RemoveObject` doesn't error on missing keys.
 
 ---
 

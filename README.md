@@ -45,7 +45,7 @@ type Store interface {
 </tr>
 <tr>
 <td><strong>S3</strong></td>
-<td>AWS S3, MinIO, R2. Cloud-native storage.</td>
+<td>S3-compatible (AWS, MinIO, R2). Cloud-native storage.</td>
 <td><code>s3/</code></td>
 </tr>
 <tr>
