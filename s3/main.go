@@ -6,22 +6,20 @@ import (
 	"io"
 	"strings"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/minio/minio-go/v7"
 
 	storemd "github.com/readmedotmd/store.md"
 )
 
 // StoreS3 implements storemd.Store using an S3-compatible backend.
 type StoreS3 struct {
-	client *s3.Client
+	client *minio.Client
 	bucket string
 	prefix string
 }
 
 // New creates a new StoreS3. The prefix is optional and will be prepended to all keys.
-func New(client *s3.Client, bucket, prefix string) *StoreS3 {
+func New(client *minio.Client, bucket, prefix string) *StoreS3 {
 	return &StoreS3{
 		client: client,
 		bucket: bucket,
@@ -38,85 +36,65 @@ func (s *StoreS3) stripPrefix(key string) string {
 }
 
 func (s *StoreS3) Get(key string) (string, error) {
-	out, err := s.client.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.fullKey(key)),
-	})
+	obj, err := s.client.GetObject(context.Background(), s.bucket, s.fullKey(key), minio.GetObjectOptions{})
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
+		return "", err
+	}
+	defer obj.Close()
+	data, err := io.ReadAll(obj)
+	if err != nil {
+		var errResp minio.ErrorResponse
+		if errors.As(err, &errResp) && errResp.Code == "NoSuchKey" {
 			return "", storemd.NotFoundError
 		}
-		// Some S3-compatible implementations return a generic error; check the message.
 		if strings.Contains(err.Error(), "NoSuchKey") {
 			return "", storemd.NotFoundError
 		}
-		return "", err
-	}
-	defer out.Body.Close()
-	data, err := io.ReadAll(out.Body)
-	if err != nil {
 		return "", err
 	}
 	return string(data), nil
 }
 
 func (s *StoreS3) Set(key, value string) error {
-	_, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.fullKey(key)),
-		Body:   strings.NewReader(value),
-	})
+	_, err := s.client.PutObject(context.Background(), s.bucket, s.fullKey(key), strings.NewReader(value), int64(len(value)), minio.PutObjectOptions{})
 	return err
 }
 
 func (s *StoreS3) Delete(key string) error {
-	// S3 DeleteObject does not error on missing keys, so check existence first.
-	_, err := s.client.HeadObject(context.Background(), &s3.HeadObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.fullKey(key)),
-	})
+	_, err := s.client.StatObject(context.Background(), s.bucket, s.fullKey(key), minio.StatObjectOptions{})
 	if err != nil {
-		var nf *types.NotFound
-		if errors.As(err, &nf) {
+		var errResp minio.ErrorResponse
+		if errors.As(err, &errResp) && (errResp.Code == "NoSuchKey" || errResp.Code == "NotFound") {
 			return storemd.NotFoundError
 		}
-		// Some S3-compatible services return a generic error for 404 on HeadObject.
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NoSuchKey") {
+		if strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
 			return storemd.NotFoundError
 		}
 		return err
 	}
 
-	_, err = s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.fullKey(key)),
-	})
-	return err
+	return s.client.RemoveObject(context.Background(), s.bucket, s.fullKey(key), minio.RemoveObjectOptions{})
 }
 
 func (s *StoreS3) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-		Prefix: aws.String(s.fullKey(args.Prefix)),
+	opts := minio.ListObjectsOptions{
+		Prefix:    s.fullKey(args.Prefix),
+		Recursive: true,
 	}
-
 	if args.StartAfter != "" {
-		input.StartAfter = aws.String(s.fullKey(args.StartAfter))
+		opts.StartAfter = s.fullKey(args.StartAfter)
 	}
 
-	if args.Limit > 0 {
-		input.MaxKeys = aws.Int32(int32(args.Limit))
-	}
-
-	out, err := s.client.ListObjectsV2(context.Background(), input)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]storemd.KeyValuePair, 0, len(out.Contents))
-	for _, obj := range out.Contents {
-		key := s.stripPrefix(aws.ToString(obj.Key))
+	ctx := context.Background()
+	result := make([]storemd.KeyValuePair, 0)
+	for obj := range s.client.ListObjects(ctx, s.bucket, opts) {
+		if obj.Err != nil {
+			return nil, obj.Err
+		}
+		if args.Limit > 0 && len(result) >= args.Limit {
+			break
+		}
+		key := s.stripPrefix(obj.Key)
 		val, err := s.Get(key)
 		if err != nil {
 			return nil, err

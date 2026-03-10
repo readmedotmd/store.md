@@ -10,15 +10,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/ory/dockertest/v3"
 
 	storemd "github.com/readmedotmd/store.md"
 )
 
-var s3Client *s3.Client
+var minioClient *minio.Client
 
 const testBucket = "test-bucket"
 
@@ -54,7 +53,7 @@ func startMinioDocker() (endpoint string, cleanup func(), err error) {
 		return "", nil, fmt.Errorf("could not start minio: %w", err)
 	}
 
-	endpoint = fmt.Sprintf("http://localhost:%s", resource.GetPort("9000/tcp"))
+	endpoint = fmt.Sprintf("localhost:%s", resource.GetPort("9000/tcp"))
 	cleanup = func() { pool.Purge(resource) }
 	return endpoint, cleanup, nil
 }
@@ -89,7 +88,7 @@ func startMinioBinary() (endpoint string, cleanup func(), err error) {
 		return "", nil, fmt.Errorf("could not start minio: %w", err)
 	}
 
-	endpoint = fmt.Sprintf("http://127.0.0.1:%d", port)
+	endpoint = fmt.Sprintf("127.0.0.1:%d", port)
 	cleanup = func() {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -110,21 +109,19 @@ func TestMain(m *testing.M) {
 	}
 	defer cleanup()
 
-	// Configure S3 client to point at the minio endpoint with path-style access.
-	s3Client = s3.NewFromConfig(aws.Config{
-		Region: "us-east-1",
-		Credentials: credentials.NewStaticCredentialsProvider(
-			"minioadmin", "minioadmin", "",
-		),
-		BaseEndpoint: aws.String(endpoint),
-	}, func(o *s3.Options) {
-		o.UsePathStyle = true
+	// Configure minio client.
+	minioClient, err = minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4("minioadmin", "minioadmin", ""),
+		Secure: false,
 	})
+	if err != nil {
+		log.Fatalf("Could not create minio client: %s", err)
+	}
 
 	// Wait for minio to be ready.
 	ready := false
 	for i := 0; i < 50; i++ {
-		_, err := s3Client.ListBuckets(context.Background(), &s3.ListBucketsInput{})
+		_, err := minioClient.ListBuckets(context.Background())
 		if err == nil {
 			ready = true
 			break
@@ -136,9 +133,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Create a test bucket.
-	_, err = s3Client.CreateBucket(context.Background(), &s3.CreateBucketInput{
-		Bucket: aws.String(testBucket),
-	})
+	err = minioClient.MakeBucket(context.Background(), testBucket, minio.MakeBucketOptions{})
 	if err != nil {
 		log.Fatalf("Could not create bucket: %s", err)
 	}
@@ -153,6 +148,6 @@ func TestS3Store(t *testing.T) {
 		// Use a unique prefix per test to provide isolation.
 		counter++
 		prefix := fmt.Sprintf("test-%d/", counter)
-		return New(s3Client, testBucket, prefix)
+		return New(minioClient, testBucket, prefix)
 	})
 }
