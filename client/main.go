@@ -189,6 +189,29 @@ func (c *Client) addConn(conn Connection, active bool) error {
 	return nil
 }
 
+// Done returns a channel that is closed when the client is closed.
+func (c *Client) Done() <-chan struct{} {
+	return c.done
+}
+
+// removeConn removes a dead connection from the list and auto-closes the
+// client when no connections remain.
+func (c *Client) removeConn(mc *managedConn) {
+	c.connsMu.Lock()
+	for i, conn := range c.conns {
+		if conn == mc {
+			c.conns = append(c.conns[:i], c.conns[i+1:]...)
+			break
+		}
+	}
+	remaining := len(c.conns)
+	c.connsMu.Unlock()
+
+	if remaining == 0 {
+		c.Close()
+	}
+}
+
 // Close stops all sync loops and closes all connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -290,6 +313,7 @@ func (c *Client) broadcast(sender *managedConn) {
 
 // readLoop reads messages from a connection and handles both client and server roles.
 func (c *Client) readLoop(mc *managedConn) {
+	defer c.removeConn(mc)
 	for {
 		msg, err := mc.ReadMessage()
 		if err != nil {
