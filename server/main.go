@@ -27,7 +27,7 @@ type Server struct {
 	auth     Authorizer
 	upgrader websocket.Upgrader
 
-	adaptersMu gosync.RWMutex
+	adaptersMu gosync.Mutex
 	adapters   map[storesync.SyncStore]*client.Client
 }
 
@@ -101,19 +101,12 @@ func (s *Server) resolveStore(r *http.Request) (storesync.SyncStore, error) {
 }
 
 func (s *Server) getAdapter(store storesync.SyncStore) *client.Client {
-	s.adaptersMu.RLock()
-	a, ok := s.adapters[store]
-	s.adaptersMu.RUnlock()
-	if ok {
-		return a
-	}
-
 	s.adaptersMu.Lock()
 	defer s.adaptersMu.Unlock()
-	if a, ok := s.adapters[store]; ok {
+	if a, ok := s.adapters[store]; ok && !a.Closed() {
 		return a
 	}
-	a = client.New(store)
+	a := client.New(store)
 	s.adapters[store] = a
 	return a
 }

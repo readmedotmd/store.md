@@ -212,6 +212,13 @@ func (c *Client) removeConn(mc *managedConn) {
 	}
 }
 
+// Closed returns true if the client has been closed.
+func (c *Client) Closed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
 // Close stops all sync loops and closes all connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
