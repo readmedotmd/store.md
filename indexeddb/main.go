@@ -152,7 +152,7 @@ func openDB(dbName, storeName string) (js.Value, error) {
 	var onUpgrade js.Func
 	onUpgrade = js.FuncOf(func(this js.Value, p []js.Value) any {
 		db := req.Get("result")
-		if !db.Call("objectStoreNames", storeName).Call("contains", storeName).Bool() {
+		if !db.Get("objectStoreNames").Call("contains", storeName).Bool() {
 			db.Call("createObjectStore", storeName)
 		}
 		upgradeDone <- struct{}{}
