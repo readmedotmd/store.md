@@ -87,6 +87,7 @@ type Client struct {
 	store    storesync.SyncStore
 	interval time.Duration
 	limit    int
+	pageSize int
 
 	connsMu gosync.RWMutex
 	conns   []*managedConn
@@ -115,11 +116,17 @@ func WithLimit(limit int) Option {
 	return func(c *Client) { c.limit = limit }
 }
 
+// WithPageSize sets the number of items per SyncOut page. Default is 100.
+func WithPageSize(size int) Option {
+	return func(c *Client) { c.pageSize = size }
+}
+
 // New creates a Client that syncs the given store over connections.
 func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
 		store:    store,
 		interval: 5 * time.Second,
+		pageSize: 100,
 		done:     make(chan struct{}),
 	}
 	for _, o := range opts {
@@ -262,20 +269,27 @@ func (c *Client) sendSyncRequest(mc *managedConn) error {
 	return mc.WriteMessage(req)
 }
 
-// sendPush pushes local changes to a single connection.
+// sendPush pushes local changes to a single connection, paginating through
+// all pending items using c.pageSize.
 func (c *Client) sendPush(mc *managedConn) error {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	payload, err := c.store.SyncOut(mc.PeerID(), c.limit)
-	if err != nil {
-		return fmt.Errorf("SyncOut: %w", err)
+	for {
+		payload, err := c.store.SyncOut(mc.PeerID(), c.pageSize)
+		if err != nil {
+			return fmt.Errorf("SyncOut: %w", err)
+		}
+		if len(payload.Items) == 0 {
+			return nil
+		}
+		if err := mc.WriteMessage(Message{Type: "sync_push", Payload: payload}); err != nil {
+			return err
+		}
+		if len(payload.Items) < c.pageSize {
+			return nil
+		}
 	}
-	if len(payload.Items) == 0 {
-		return nil
-	}
-
-	return mc.WriteMessage(Message{Type: "sync_push", Payload: payload})
 }
 
 // pushActive pushes local changes to all active (client-side) connections.
@@ -337,21 +351,37 @@ func (c *Client) readLoop(mc *managedConn) {
 		// --- Server role: respond to remote peer's requests ---
 
 		case "sync_request":
-			limit := 0
+			pageSize := c.pageSize
 			if msg.Limit != "" {
-				fmt.Sscanf(msg.Limit, "%d", &limit)
+				var requested int
+				fmt.Sscanf(msg.Limit, "%d", &requested)
+				if requested > 0 && requested < pageSize {
+					pageSize = requested
+				}
 			}
-			payload, err := c.store.SyncOut(mc.PeerID(), limit)
-			if err != nil {
-				log.Printf("sync client: SyncOut error: %v", err)
+			mc.mu.Lock()
+			var syncErr error
+			for {
+				payload, err := c.store.SyncOut(mc.PeerID(), pageSize)
+				if err != nil {
+					syncErr = err
+					break
+				}
+				if err := mc.WriteMessage(Message{Type: "sync_response", Payload: payload}); err != nil {
+					syncErr = err
+					break
+				}
+				if len(payload.Items) < pageSize {
+					break
+				}
+			}
+			mc.mu.Unlock()
+			if syncErr != nil {
+				log.Printf("sync client: SyncOut error: %v", syncErr)
 				mc.mu.Lock()
 				mc.WriteMessage(Message{Type: "error", Error: "internal error"})
 				mc.mu.Unlock()
-				continue
 			}
-			mc.mu.Lock()
-			mc.WriteMessage(Message{Type: "sync_response", Payload: payload})
-			mc.mu.Unlock()
 
 		case "sync_push":
 			if msg.Payload == nil {

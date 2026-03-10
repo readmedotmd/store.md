@@ -311,7 +311,13 @@ func (s *StoreSync) SyncIn(peerID string, payload SyncPayload) error {
 	return s.store.Set(lastSyncInKey(peerID), string(encoded))
 }
 
+const MaxSyncOutLimit = 1000
+
 func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
+	if limit <= 0 || limit > MaxSyncOutLimit {
+		limit = MaxSyncOutLimit
+	}
+
 	var lastSyncTimestamp int64
 
 	raw, err := s.store.Get(lastSyncOutKey(peerID))
