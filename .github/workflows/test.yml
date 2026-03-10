@@ -1,0 +1,58 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (no Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run bbolt tests
+        run: go test -v -count=1 ./bbolt/...
+
+      - name: Run badger tests
+        run: go test -v -count=1 ./badger/...
+
+      - name: Run sql tests
+        run: go test -v -count=1 ./sql/...
+
+      - name: Run sync tests
+        run: go test -v -count=1 ./sync/...
+
+      - name: Run server tests
+        run: go test -v -count=1 ./server/...
+
+      - name: Run message tests
+        run: go test -v -count=1 ./message/...
+
+      - name: Verify indexeddb compiles (WASM)
+        run: GOOS=js GOARCH=wasm go build ./indexeddb/...
+
+  integration-tests:
+    name: Integration Tests (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run S3 tests (MinIO)
+        run: go test -v -count=1 -timeout=120s ./s3/...
+
+      - name: Run MongoDB tests
+        run: go test -v -count=1 -timeout=120s ./mongodb/...
+
+      - name: Run Redis tests
+        run: go test -v -count=1 -timeout=120s ./redis/...
