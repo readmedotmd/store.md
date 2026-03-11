@@ -1,0 +1,30 @@
+name: Banner
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/banner.yml
+  workflow_dispatch:
+
+jobs:
+  generate:
+    name: Generate Banner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate banner SVG
+        run: |
+          curl -sf -o .github/banner.svg \
+            -H "X-API-Key: ${{ secrets.STYLEMD_API_KEY }}" \
+            "https://faas-lon1-917a94a7.doserverless.co/api/v1/web/fn-38e8948f-7a79-4b9d-af0e-f6399470d7be/generate/svg?type=root"
+
+      - name: Commit banner
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/banner.svg
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Update banner image"
+          git push
