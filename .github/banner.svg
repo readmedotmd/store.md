@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="560" viewBox="0 0 1800 560">
+  <defs><style>@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&amp;display=swap');</style></defs>
+  <rect width="1800" height="560" fill="#FFFFFF"/>
+  <rect x="58" y="58" width="1704" height="464" rx="12" fill="#000000"/>
+  <clipPath id="card-clip"><rect x="48" y="48" width="1704" height="464" rx="12"/></clipPath>
+  <rect x="48" y="48" width="1704" height="464" rx="12" fill="#FFFFFF"/>
+  <rect x="48" y="48" width="1704" height="176" fill="#2D333B" clip-path="url(#card-clip)"/>
+  <text x="104" y="110" font-family="'Space Mono', 'Courier New', monospace" font-size="20" fill="#888888" font-weight="700" letter-spacing="2">PROJECT</text>
+  <text x="104" y="175" font-family="'Space Mono', 'Courier New', monospace" font-size="56" fill="#FF5500" font-weight="700" letter-spacing="1">STORE.md</text>
+  <text x="1696" y="110" font-family="'Space Mono', 'Courier New', monospace" font-size="20" fill="#888888" font-weight="700" letter-spacing="2" text-anchor="end">VERSION</text>
+  <text x="1696" y="175" font-family="'Space Mono', 'Courier New', monospace" font-size="48" fill="#FFFFFF" font-weight="700" letter-spacing="1" text-anchor="end">V0.0.0</text>
+  <circle cx="448" cy="155" r="8" fill="#34C759"/>
+  <rect x="48" y="500" width="1704" height="12" fill="#FF5500" clip-path="url(#card-clip)"/>
+  <rect x="48" y="48" width="1704" height="464" rx="12" fill="none" stroke="#000000" stroke-width="8"/>
+  <line x1="48" y1="224" x2="1752" y2="224" stroke="#000000" stroke-width="8"/>
+</svg>
