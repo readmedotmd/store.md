@@ -34,26 +34,40 @@ func (s *StoreIndexedDB) Close() error {
 }
 
 func (s *StoreIndexedDB) Get(key string) (string, error) {
-	tx := s.db.Call("transaction", s.storeName, "readonly")
-	store := tx.Call("objectStore", s.storeName)
-	req := store.Call("get", key)
+	type result struct {
+		val string
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readonly")
+		store := tx.Call("objectStore", s.storeName)
+		req := store.Call("get", key)
 
-	val, err := awaitRequest(req)
-	if err != nil {
-		return "", err
-	}
-	if val.IsUndefined() || val.IsNull() {
-		return "", storemd.NotFoundError
-	}
-	return val.String(), nil
+		val, err := awaitRequest(req)
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		if val.IsUndefined() || val.IsNull() {
+			ch <- result{err: storemd.NotFoundError}
+			return
+		}
+		ch <- result{val: val.String()}
+	}()
+	r := <-ch
+	return r.val, r.err
 }
 
 func (s *StoreIndexedDB) Set(key, value string) error {
-	tx := s.db.Call("transaction", s.storeName, "readwrite")
-	store := tx.Call("objectStore", s.storeName)
-	store.Call("put", value, key)
-
-	return awaitTransaction(tx)
+	ch := make(chan error, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readwrite")
+		store := tx.Call("objectStore", s.storeName)
+		store.Call("put", value, key)
+		ch <- awaitTransaction(tx)
+	}()
+	return <-ch
 }
 
 func (s *StoreIndexedDB) Delete(key string) error {
@@ -63,83 +77,96 @@ func (s *StoreIndexedDB) Delete(key string) error {
 		return err
 	}
 
-	tx := s.db.Call("transaction", s.storeName, "readwrite")
-	store := tx.Call("objectStore", s.storeName)
-	store.Call("delete", key)
-
-	return awaitTransaction(tx)
+	ch := make(chan error, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readwrite")
+		store := tx.Call("objectStore", s.storeName)
+		store.Call("delete", key)
+		ch <- awaitTransaction(tx)
+	}()
+	return <-ch
 }
 
 func (s *StoreIndexedDB) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	tx := s.db.Call("transaction", s.storeName, "readonly")
-	store := tx.Call("objectStore", s.storeName)
-
-	// Use a key range if we have a prefix to narrow the scan.
-	var req js.Value
-	if args.Prefix != "" {
-		lower := js.Global().Get("IDBKeyRange").Call("bound", args.Prefix, args.Prefix+"\uffff")
-		req = store.Call("openCursor", lower)
-	} else {
-		req = store.Call("openCursor")
+	type result struct {
+		items []storemd.KeyValuePair
+		err   error
 	}
+	ch := make(chan result, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readonly")
+		store := tx.Call("objectStore", s.storeName)
 
-	var result []storemd.KeyValuePair
-	done := make(chan error, 1)
-
-	var onSuccess, onError js.Func
-	onSuccess = js.FuncOf(func(this js.Value, p []js.Value) any {
-		cursor := req.Get("result")
-		if cursor.IsNull() || cursor.IsUndefined() {
-			done <- nil
-			return nil
+		// Use a key range if we have a prefix to narrow the scan.
+		var req js.Value
+		if args.Prefix != "" {
+			lower := js.Global().Get("IDBKeyRange").Call("bound", args.Prefix, args.Prefix+"\uffff")
+			req = store.Call("openCursor", lower)
+		} else {
+			req = store.Call("openCursor")
 		}
 
-		key := cursor.Get("key").String()
-		value := cursor.Get("value").String()
+		var items []storemd.KeyValuePair
+		done := make(chan error, 1)
 
-		if args.Prefix != "" && !strings.HasPrefix(key, args.Prefix) {
-			done <- nil
-			return nil
-		}
+		var onSuccess, onError js.Func
+		onSuccess = js.FuncOf(func(this js.Value, p []js.Value) any {
+			cursor := req.Get("result")
+			if cursor.IsNull() || cursor.IsUndefined() {
+				done <- nil
+				return nil
+			}
 
-		if args.StartAfter != "" && key <= args.StartAfter {
+			key := cursor.Get("key").String()
+			value := cursor.Get("value").String()
+
+			if args.Prefix != "" && !strings.HasPrefix(key, args.Prefix) {
+				done <- nil
+				return nil
+			}
+
+			if args.StartAfter != "" && key <= args.StartAfter {
+				cursor.Call("continue")
+				return nil
+			}
+
+			items = append(items, storemd.KeyValuePair{Key: key, Value: value})
+
+			if args.Limit > 0 && len(items) >= args.Limit {
+				done <- nil
+				return nil
+			}
+
 			cursor.Call("continue")
 			return nil
-		}
-
-		result = append(result, storemd.KeyValuePair{Key: key, Value: value})
-
-		if args.Limit > 0 && len(result) >= args.Limit {
-			done <- nil
+		})
+		onError = js.FuncOf(func(this js.Value, p []js.Value) any {
+			done <- js.Error{Value: req.Get("error")}
 			return nil
+		})
+
+		req.Set("onsuccess", onSuccess)
+		req.Set("onerror", onError)
+
+		err := <-done
+		onSuccess.Release()
+		onError.Release()
+
+		if err != nil {
+			ch <- result{err: err}
+			return
 		}
-
-		cursor.Call("continue")
-		return nil
-	})
-	onError = js.FuncOf(func(this js.Value, p []js.Value) any {
-		done <- js.Error{Value: req.Get("error")}
-		return nil
-	})
-
-	req.Set("onsuccess", onSuccess)
-	req.Set("onerror", onError)
-
-	err := <-done
-	onSuccess.Release()
-	onError.Release()
-
-	if err != nil {
-		return nil, err
-	}
-	if result == nil {
-		result = []storemd.KeyValuePair{}
-	}
-	// IndexedDB iterates keys in order, but sort to guarantee the contract.
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Key < result[j].Key
-	})
-	return result, nil
+		if items == nil {
+			items = []storemd.KeyValuePair{}
+		}
+		// IndexedDB iterates keys in order, but sort to guarantee the contract.
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Key < items[j].Key
+		})
+		ch <- result{items: items}
+	}()
+	r := <-ch
+	return r.items, r.err
 }
 
 // openDB opens an IndexedDB database, creating the object store if needed.
