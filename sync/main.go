@@ -70,27 +70,27 @@ func (s *StoreSync) notifyListeners(item SyncStoreItem) {
 	}
 }
 
-func viewKey(key string) string {
+func ViewKey(key string) string {
 	return "%sync%view%" + key
 }
 
-func valueKey(id string) string {
+func ValueKey(id string) string {
 	return "%sync%value%" + id
 }
 
-func queueKey(id string) string {
+func QueueKey(id string) string {
 	return "%sync%queue%" + id
 }
 
-func queueID(writeTime int64, id, key string) string {
+func QueueID(writeTime int64, id, key string) string {
 	return fmt.Sprintf("%d%%%s%%%s", writeTime, id, key)
 }
 
-func lastSyncInKey(peerID string) string {
+func LastSyncInKey(peerID string) string {
 	return "%sync%lastsyncin%" + peerID
 }
 
-func lastSyncOutKey(peerID string) string {
+func LastSyncOutKey(peerID string) string {
 	return "%sync%lastsyncout%" + peerID
 }
 
@@ -137,11 +137,11 @@ func (s *StoreSync) Delete(key string) error {
 // List implements storemd.Store. Lists keys through the sync view layer.
 func (s *StoreSync) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	viewArgs := storemd.ListArgs{
-		Prefix: viewKey(args.Prefix),
+		Prefix: ViewKey(args.Prefix),
 		Limit:  args.Limit,
 	}
 	if args.StartAfter != "" {
-		viewArgs.StartAfter = viewKey(args.StartAfter)
+		viewArgs.StartAfter = ViewKey(args.StartAfter)
 	}
 
 	list, err := s.store.List(viewArgs)
@@ -181,7 +181,7 @@ func (s *StoreSync) GetItem(key string) (*SyncStoreItem, error) {
 
 // getItem returns the raw SyncStoreItem including tombstones.
 func (s *StoreSync) getItem(key string) (*SyncStoreItem, error) {
-	valueID, err := s.store.Get(viewKey(key))
+	valueID, err := s.store.Get(ViewKey(key))
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +189,7 @@ func (s *StoreSync) getItem(key string) (*SyncStoreItem, error) {
 }
 
 func (s *StoreSync) getValue(id string) (*SyncStoreItem, error) {
-	raw, err := s.store.Get(valueKey(id))
+	raw, err := s.store.Get(ValueKey(id))
 	if err != nil {
 		return nil, err
 	}
@@ -203,11 +203,11 @@ func (s *StoreSync) getValue(id string) (*SyncStoreItem, error) {
 // ListItems returns SyncStoreItems matching the given prefix, pagination, and limit.
 func (s *StoreSync) ListItems(prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
 	args := storemd.ListArgs{
-		Prefix: viewKey(prefix),
+		Prefix: ViewKey(prefix),
 		Limit:  limit,
 	}
 	if startAfter != "" {
-		args.StartAfter = viewKey(startAfter)
+		args.StartAfter = ViewKey(startAfter)
 	}
 
 	list, err := s.store.List(args)
@@ -258,20 +258,20 @@ func (s *StoreSync) setItem(item SyncStoreItem) error {
 	}
 
 	item.WriteTimestamp = writeTime
-	queueID := queueID(writeTime, item.ID, item.Key)
+	queueID := QueueID(writeTime, item.ID, item.Key)
 
 	encoded, err := json.Marshal(item)
 	if err != nil {
 		return err
 	}
 
-	if err := s.store.Set(queueKey(queueID), item.ID); err != nil {
+	if err := s.store.Set(QueueKey(queueID), item.ID); err != nil {
 		return err
 	}
-	if err := s.store.Set(viewKey(item.Key), item.ID); err != nil {
+	if err := s.store.Set(ViewKey(item.Key), item.ID); err != nil {
 		return err
 	}
-	if err := s.store.Set(valueKey(item.ID), string(encoded)); err != nil {
+	if err := s.store.Set(ValueKey(item.ID), string(encoded)); err != nil {
 		return err
 	}
 
@@ -295,6 +295,7 @@ func (s *StoreSync) setItem(item SyncStoreItem) error {
 type SyncPayload struct {
 	Items             []SyncStoreItem `json:"items"`
 	LastSyncTimestamp int64           `json:"lastSyncTimestamp"`
+	Fingerprints      []uint64        `json:"fingerprints,omitempty"`
 }
 
 func (s *StoreSync) SyncIn(peerID string, payload SyncPayload) error {
@@ -308,7 +309,7 @@ func (s *StoreSync) SyncIn(peerID string, payload SyncPayload) error {
 	if err != nil {
 		return err
 	}
-	return s.store.Set(lastSyncInKey(peerID), string(encoded))
+	return s.store.Set(LastSyncInKey(peerID), string(encoded))
 }
 
 const MaxSyncOutLimit = 1000
@@ -320,7 +321,7 @@ func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
 
 	var lastSyncTimestamp int64
 
-	raw, err := s.store.Get(lastSyncOutKey(peerID))
+	raw, err := s.store.Get(LastSyncOutKey(peerID))
 	if err != nil && err != storemd.NotFoundError {
 		return nil, err
 	}
@@ -339,7 +340,7 @@ func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.Set(lastSyncOutKey(peerID), string(encoded)); err != nil {
+	if err := s.store.Set(LastSyncOutKey(peerID), string(encoded)); err != nil {
 		return nil, err
 	}
 
@@ -350,14 +351,14 @@ func (s *StoreSync) syncOut(timestamp int64, limit int) (*SyncPayload, error) {
 	now := time.Now().UnixNano()
 
 	args := storemd.ListArgs{
-		Prefix:     queueKey(""),
+		Prefix:     QueueKey(""),
 		// Use ~ instead of % as the suffix after the timestamp. Queue entries are
 		// keyed as {writeTime}%{uuid}%{key}, so using % would produce a StartAfter
 		// that is lexicographically before entries with the same timestamp (because
 		// {ts}% < {ts}%{uuid}%...), causing them to be included again. The ~ char
 		// sorts after all alphanumeric and % characters, ensuring we skip past all
 		// entries with the given timestamp.
-		StartAfter: queueKey(fmt.Sprintf("%d~", timestamp)),
+		StartAfter: QueueKey(fmt.Sprintf("%d~", timestamp)),
 		Limit:      limit,
 	}
 
