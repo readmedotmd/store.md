@@ -1,6 +1,6 @@
 # Client Adapter
 
-The `client` package is a sync adapter that connects a local `SyncStore` to one or more remote peers over WebSocket. It handles the full sync protocol for both client-side and server-side roles.
+The `sync/client` package is a sync adapter that connects a local `SyncStore` to one or more remote peers over WebSocket. It handles the full sync protocol for both client-side and server-side roles.
 
 ## Connection Interface
 
@@ -26,14 +26,14 @@ Two implementations are provided:
 import (
     "net/http"
 
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/client"
-    "github.com/readmedotmd/store.md/sync"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/client"
+    "github.com/readmedotmd/store.md/sync/core"
 )
 
 store, _ := bbolt.New("local.db")
 defer store.Close()
-ss := sync.New(store)
+ss := core.New(store)
 
 c := client.New(ss, client.WithInterval(5*time.Second))
 defer c.Close()
@@ -53,8 +53,8 @@ The adapter supports two types of connections:
 
 Created via `Connect` or by calling `Dial` + `AddConnection` with the active flag. Active connections:
 
-- Send an initial `sync_request` on connect
-- Run a periodic pull loop (configurable interval)
+- Initiate a sync exchange on connect
+- Run a periodic sync loop (configurable interval)
 - Automatically push local changes via `OnUpdate`
 
 ```go
@@ -66,8 +66,8 @@ c.Connect("peer-id", "ws://server:8080", header)
 
 Created via `AddConnection`. Passive connections:
 
-- Only respond to incoming `sync_request` and `sync_push` messages
-- Do **not** initiate pulls or push local changes automatically
+- Only respond to incoming `sync` messages
+- Do **not** initiate sync or push local changes automatically
 - Broadcast `sync_update` notifications to other connections when new data arrives
 
 ```go
@@ -92,28 +92,24 @@ c.Connect("peer-a", "ws://server-a:8080", headerA)
 c.Connect("peer-b", "ws://server-b:8080", headerB)
 ```
 
-Data written locally is pushed to all active connections. Data received from one connection is broadcast (via `sync_update`) to all other connections.
+Data written locally is synced to all active connections. Data received from one connection is broadcast (via `sync_update`) to all other connections.
 
 ## Protocol
 
-The adapter handles both sides of the sync protocol in a single read loop:
+The adapter uses two message types:
 
 | Message | Direction | Behavior |
 |---------|-----------|----------|
-| `sync_request` | Incoming | Calls `SyncOut` and responds with `sync_response` |
-| `sync_push` | Incoming | Calls `SyncIn`, responds with `sync_ack`, broadcasts `sync_update` to others |
-| `sync_response` | Incoming | Calls `SyncIn` to apply received data |
-| `sync_ack` | Incoming | No-op (push acknowledged) |
-| `sync_update` | Incoming | Sends a `sync_request` to pull new data |
+| `sync` | Both | Carries a `SyncPayload`. Calls `store.Sync(peerID, payload)` and sends the response if non-nil. |
+| `sync_update` | Both | Notification that the peer has new data. Triggers a sync exchange on the receiving side. |
+
+On local update (`OnUpdate`), the adapter initiates sync on all active connections and broadcasts `sync_update` to all passive connections.
 
 ## Options
 
 ```go
-// Set the pull interval (default: 5 seconds)
+// Set the sync interval (default: 5 seconds)
 client.WithInterval(10 * time.Second)
-
-// Limit items per sync request (default: 0 = no limit)
-client.WithLimit(100)
 ```
 
 ## How the Server Uses It

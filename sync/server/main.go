@@ -8,8 +8,8 @@ import (
 	gosync "sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/readmedotmd/store.md/client"
-	storesync "github.com/readmedotmd/store.md/sync"
+	"github.com/readmedotmd/store.md/sync/client"
+	storesync "github.com/readmedotmd/store.md/sync/core"
 )
 
 // Authorizer extracts a peer ID from a request, returning an error if unauthorized.
@@ -173,6 +173,25 @@ func (s *Server) ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/", s)
 	return http.ListenAndServe(addr, mux)
+}
+
+// Close closes all client adapters managed by this server, waiting for their
+// goroutines to drain. Call this before closing the underlying stores.
+func (s *Server) Close() error {
+	s.adaptersMu.Lock()
+	adapters := make([]*client.Client, 0, len(s.adapters))
+	for _, a := range s.adapters {
+		adapters = append(adapters, a)
+	}
+	s.adaptersMu.Unlock()
+
+	var firstErr error
+	for _, a := range adapters {
+		if err := a.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 var _ http.Handler = (*Server)(nil)

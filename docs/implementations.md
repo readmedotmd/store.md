@@ -4,12 +4,12 @@ All implementations satisfy the `storemd.Store` interface and pass the generic t
 
 ---
 
-## BBolt — `bbolt/`
+## BBolt — `backend/bbolt/`
 
 Embedded key-value store using [bbolt](https://github.com/etcd-io/bbolt). Single-file, no server required.
 
 ```go
-import "github.com/readmedotmd/store.md/bbolt"
+import "github.com/readmedotmd/store.md/backend/bbolt"
 
 store, err := bbolt.New("/path/to/data.db")
 defer store.Close()
@@ -19,12 +19,12 @@ defer store.Close()
 
 ---
 
-## Badger — `badger/`
+## Badger — `backend/badger/`
 
 High-performance embedded store using [badger](https://github.com/dgraph-io/badger). LSM-tree based, optimized for SSDs.
 
 ```go
-import "github.com/readmedotmd/store.md/badger"
+import "github.com/readmedotmd/store.md/backend/badger"
 
 store, err := badger.New("/path/to/data-dir")
 defer store.Close()
@@ -34,7 +34,7 @@ defer store.Close()
 
 ---
 
-## SQL — `sql/`
+## SQL — `backend/sql/`
 
 Uses `database/sql` with upsert support. Tested with SQLite via [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) (pure Go, no CGO). Compatible with any SQL database that supports `ON CONFLICT`.
 
@@ -42,7 +42,7 @@ Uses `database/sql` with upsert support. Tested with SQLite via [modernc.org/sql
 import (
     "database/sql"
 
-    sqlstore "github.com/readmedotmd/store.md/sql"
+    sqlstore "github.com/readmedotmd/store.md/backend/sql"
     _ "modernc.org/sqlite"
 )
 
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS kv_store (
 
 ---
 
-## S3 — `s3/`
+## S3 — `backend/s3/`
 
 Uses [MinIO Go client](https://pkg.go.dev/github.com/minio/minio-go/v7) with any S3-compatible backend (AWS S3, MinIO, R2, etc).
 
@@ -72,7 +72,7 @@ import (
     "github.com/minio/minio-go/v7"
     "github.com/minio/minio-go/v7/pkg/credentials"
 
-    s3store "github.com/readmedotmd/store.md/s3"
+    s3store "github.com/readmedotmd/store.md/backend/s3"
 )
 
 client, _ := minio.New("s3.amazonaws.com", &minio.Options{
@@ -90,7 +90,7 @@ Values are stored as object contents. `List` uses `ListObjects` and fetches each
 
 ---
 
-## MongoDB — `mongodb/`
+## MongoDB — `backend/mongodb/`
 
 Uses the official [MongoDB Go driver v2](https://pkg.go.dev/go.mongodb.org/mongo-driver/v2).
 
@@ -99,7 +99,7 @@ import (
     "go.mongodb.org/mongo-driver/v2/mongo"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 
-    "github.com/readmedotmd/store.md/mongodb"
+    "github.com/readmedotmd/store.md/backend/mongodb"
 )
 
 client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
@@ -113,7 +113,7 @@ Documents are stored as `{_id: key, value: value}`. List uses regex for prefix f
 
 ---
 
-## Redis — `redis/`
+## Redis — `backend/redis/`
 
 Uses [go-redis v9](https://github.com/redis/go-redis).
 
@@ -121,7 +121,7 @@ Uses [go-redis v9](https://github.com/redis/go-redis).
 import (
     "github.com/redis/go-redis/v9"
 
-    redisstore "github.com/readmedotmd/store.md/redis"
+    redisstore "github.com/readmedotmd/store.md/backend/redis"
 )
 
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
@@ -136,14 +136,14 @@ store := redisstore.New(client, "myapp:") // key prefix for namespacing
 
 ---
 
-## IndexedDB — `indexeddb/`
+## IndexedDB — `backend/indexeddb/`
 
 Browser-native key-value store via IndexedDB, compiled to WebAssembly. Uses `syscall/js` to interact with the IndexedDB API.
 
 ```go
 //go:build js && wasm
 
-import "github.com/readmedotmd/store.md/indexeddb"
+import "github.com/readmedotmd/store.md/backend/indexeddb"
 
 store, err := indexeddb.New("my-database")
 defer store.Close()
@@ -163,13 +163,12 @@ Values are stored in a `kv` object store. Cursor iteration provides lexicographi
 
 ---
 
-## Sync Implementations
+## Sync Implementation
 
-Two `SyncStore` implementations are available, both wrapping any `Store`:
+The `sync/core/` package provides a `SyncStore` implementation wrapping any `Store`:
 
 | Package | Description |
 |---------|-------------|
-| `sync/` | Queue-based sync with timestamp conflict resolution. See [sync.md](sync.md). |
-| `fingerprintsync/` | Queue-based sync + XOR fingerprint reconciliation for mesh topologies. See [fingerprintsync.md](fingerprintsync.md). |
+| `sync/core/` | Queue-based sync with timestamp conflict resolution. See [sync.md](sync.md). |
 
-Both implement the `sync.SyncStore` interface and can be used interchangeably with the server and client packages.
+It implements the `core.SyncStore` interface and works with the server and client packages.

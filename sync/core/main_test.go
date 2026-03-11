@@ -1,23 +1,16 @@
-package sync
+package core
 
 import (
-	"path/filepath"
 	"testing"
 	"time"
 
 	storemd "github.com/readmedotmd/store.md"
-	"github.com/readmedotmd/store.md/bbolt"
+	"github.com/readmedotmd/store.md/backend/memory"
 )
 
 func newTestStore(t *testing.T) storemd.Store {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store, err := bbolt.New(dbPath)
-	if err != nil {
-		t.Fatalf("failed to create bbolt store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return store
+	return memory.New()
 }
 
 func newTestSyncStore(t *testing.T) *StoreSync {

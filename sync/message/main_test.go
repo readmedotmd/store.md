@@ -4,28 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	gosync "sync"
 	"testing"
 	"time"
 
 	storemd "github.com/readmedotmd/store.md"
-	"github.com/readmedotmd/store.md/bbolt"
-	"github.com/readmedotmd/store.md/sync"
+	"github.com/readmedotmd/store.md/backend/memory"
+	"github.com/readmedotmd/store.md/sync/core"
 )
 
-func newTestSyncStore(t *testing.T) *sync.StoreSync {
+func newTestSyncStore(t *testing.T) *core.StoreSync {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store, err := bbolt.New(dbPath)
-	if err != nil {
-		t.Fatalf("failed to create bbolt store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return sync.New(store, int64(100*time.Millisecond))
+	return core.New(memory.New(), int64(100*time.Millisecond))
 }
 
-func newTestMessageStore(t *testing.T, ss *sync.StoreSync, id string) *StoreMessage {
+func newTestMessageStore(t *testing.T, ss *core.StoreSync, id string) *StoreMessage {
 	t.Helper()
 	m := New(ss, id)
 	t.Cleanup(func() { m.Close() })

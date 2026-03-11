@@ -10,12 +10,12 @@ Then import the backend you need:
 
 ```bash
 # Pick one (or more)
-go get github.com/readmedotmd/store.md/bbolt
-go get github.com/readmedotmd/store.md/badger
-go get github.com/readmedotmd/store.md/sql
-go get github.com/readmedotmd/store.md/s3
-go get github.com/readmedotmd/store.md/mongodb
-go get github.com/readmedotmd/store.md/redis
+go get github.com/readmedotmd/store.md/backend/bbolt
+go get github.com/readmedotmd/store.md/backend/badger
+go get github.com/readmedotmd/store.md/backend/sql
+go get github.com/readmedotmd/store.md/backend/s3
+go get github.com/readmedotmd/store.md/backend/mongodb
+go get github.com/readmedotmd/store.md/backend/redis
 ```
 
 ## The Store Interface
@@ -62,7 +62,7 @@ import (
     "log"
 
     storemd "github.com/readmedotmd/store.md"
-    "github.com/readmedotmd/store.md/bbolt"
+    "github.com/readmedotmd/store.md/backend/bbolt"
 )
 
 func main() {

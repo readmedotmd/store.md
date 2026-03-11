@@ -3,25 +3,18 @@ package client_test
 import (
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/readmedotmd/store.md/bbolt"
-	"github.com/readmedotmd/store.md/client"
-	"github.com/readmedotmd/store.md/server"
-	storesync "github.com/readmedotmd/store.md/sync"
+	"github.com/readmedotmd/store.md/backend/memory"
+	"github.com/readmedotmd/store.md/sync/client"
+	storesync "github.com/readmedotmd/store.md/sync/core"
+	"github.com/readmedotmd/store.md/sync/server"
 )
 
 func newSyncStore(t *testing.T) storesync.SyncStore {
 	t.Helper()
-	dbPath := filepath.Join(t.TempDir(), "test.db")
-	store, err := bbolt.New(dbPath)
-	if err != nil {
-		t.Fatalf("failed to create bbolt store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-	return storesync.New(store, int64(100*time.Millisecond))
+	return storesync.New(memory.New(), int64(100*time.Millisecond))
 }
 
 func startServer(t *testing.T, ss storesync.SyncStore) *httptest.Server {
@@ -99,7 +92,7 @@ func TestClient_PushToServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for the initial sync_request/response to complete before writing,
+	// Wait for the initial sync exchange to complete before writing,
 	// so the push doesn't race with it.
 	time.Sleep(200 * time.Millisecond)
 

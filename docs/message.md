@@ -1,6 +1,6 @@
 # Message Store
 
-The `message` package adds request/response messaging on top of the sync store. Messages are transported through the sync layer — they sync between peers like any other data.
+The `sync/message` package adds request/response messaging on top of the sync store. Messages are transported through the sync layer — they sync between peers like any other data.
 
 ## How It Works
 
@@ -27,10 +27,10 @@ type Envelope struct {
 
 ## Store Interface
 
-`StoreMessage` implements the `sync.SyncStore` interface (which embeds `storemd.Store`), so it can be used anywhere a `Store` or `SyncStore` is expected — including the server and client adapter packages.
+`StoreMessage` implements the `core.SyncStore` interface (which embeds `storemd.Store`), so it can be used anywhere a `Store` or `SyncStore` is expected — including the server and client adapter packages.
 
 ```go
-var _ sync.SyncStore = (*StoreMessage)(nil)
+var _ core.SyncStore = (*StoreMessage)(nil)
 ```
 
 ## Quick Start
@@ -40,14 +40,14 @@ import (
     "context"
     "fmt"
 
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/sync"
-    "github.com/readmedotmd/store.md/message"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/core"
+    "github.com/readmedotmd/store.md/sync/message"
 )
 
 store, _ := bbolt.New("data.db")
 defer store.Close()
-ss := sync.New(store)
+ss := core.New(store)
 
 // Create two message stores on the same sync store
 alice := message.New(ss, "alice")
@@ -69,7 +69,7 @@ fmt.Println(resp) // hello world
 ### New
 
 ```go
-func New(syncStore *sync.StoreSync, id string) *StoreMessage
+func New(syncStore *core.StoreSync, id string) *StoreMessage
 ```
 
 Creates a message store with the given ID. The ID should be a known constant so other stores can address it.
@@ -118,14 +118,14 @@ Unsubscribes from the sync store and cancels any pending `Send` calls.
 
 ## Cross-Store Messaging
 
-Messages work across separate stores connected via sync. When Store A sends a message, it writes a request item to the sync store. After `SyncOut` / `SyncIn`, the request reaches Store B, which processes it and writes a response. After another sync round, the response reaches Store A.
+Messages work across separate stores connected via sync. When Store A sends a message, it writes a request item to the sync store. After syncing, the request reaches Store B, which processes it and writes a response. After another sync round, the response reaches Store A.
 
 ```go
 // Two stores on separate backends
 store1, _ := bbolt.New("node1.db")
 store2, _ := bbolt.New("node2.db")
-ss1 := sync.New(store1)
-ss2 := sync.New(store2)
+ss1 := core.New(store1)
+ss2 := core.New(store2)
 
 a := message.New(ss1, "a")
 b := message.New(ss2, "b")
@@ -135,8 +135,7 @@ b.Handle("ping", func(msg message.Envelope) (string, error) {
 })
 
 // Send from A (writes request to ss1)
-// Then sync ss1 -> ss2 to deliver the request
-// Then sync ss2 -> ss1 to deliver the response
+// Then sync ss1 <-> ss2 to deliver the request and response
 ```
 
 ## Listener Isolation

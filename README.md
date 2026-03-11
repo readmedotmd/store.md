@@ -31,37 +31,37 @@ type Store interface {
 <tr>
 <td width="150"><strong>BBolt</strong></td>
 <td>Embedded B+ tree. Single file. Zero config.</td>
-<td><code>bbolt/</code></td>
+<td><code>backend/bbolt/</code></td>
 </tr>
 <tr>
 <td><strong>Badger</strong></td>
 <td>LSM-tree. SSD-optimized. High throughput.</td>
-<td><code>badger/</code></td>
+<td><code>backend/badger/</code></td>
 </tr>
 <tr>
 <td><strong>SQL</strong></td>
 <td>Any SQL database. Tested with SQLite (pure Go).</td>
-<td><code>sql/</code></td>
+<td><code>backend/sql/</code></td>
 </tr>
 <tr>
 <td><strong>S3</strong></td>
 <td>S3-compatible (AWS, MinIO, R2). Cloud-native storage.</td>
-<td><code>s3/</code></td>
+<td><code>backend/s3/</code></td>
 </tr>
 <tr>
 <td><strong>MongoDB</strong></td>
 <td>Document store. Atlas or self-hosted.</td>
-<td><code>mongodb/</code></td>
+<td><code>backend/mongodb/</code></td>
 </tr>
 <tr>
 <td><strong>Redis</strong></td>
 <td>In-memory. Fast reads. Shared state.</td>
-<td><code>redis/</code></td>
+<td><code>backend/redis/</code></td>
 </tr>
 <tr>
 <td><strong>IndexedDB</strong></td>
 <td>Browser-native. WASM. Offline-first.</td>
-<td><code>indexeddb/</code></td>
+<td><code>backend/indexeddb/</code></td>
 </tr>
 </table>
 
@@ -73,7 +73,7 @@ type Store interface {
 
 ```bash
 go get github.com/readmedotmd/store.md
-go get github.com/readmedotmd/store.md/bbolt
+go get github.com/readmedotmd/store.md/backend/bbolt
 ```
 
 ```go
@@ -83,7 +83,7 @@ import (
     "fmt"
 
     storemd "github.com/readmedotmd/store.md"
-    "github.com/readmedotmd/store.md/bbolt"
+    "github.com/readmedotmd/store.md/backend/bbolt"
 )
 
 func main() {
@@ -107,24 +107,22 @@ func main() {
 
 ## Sync Engine
 
-Built-in peer-to-peer synchronization with **last-write-wins conflict resolution** and **per-peer incremental cursors**.
+Built-in peer-to-peer synchronization with **last-write-wins conflict resolution**.
 
 ```go
-import "github.com/readmedotmd/store.md/sync"
+import "github.com/readmedotmd/store.md/sync/core"
 
-ss := sync.New(store)
+ss := core.New(store)
 
 // Write data
 ss.SetItem("myapp", "config", `{"theme":"dark"}`)
 
-// Send to a peer
-payload, _ := ss.SyncOut("peer-2", "")
-
-// Receive from a peer
-ss.SyncIn("peer-1", payload)
+// Sync with a peer
+outgoing, _ := ss.Sync("peer-2", nil)        // initiate
+response, _ := peer.Sync("peer-1", outgoing) // peer processes and responds
 ```
 
-Every write is recorded in an ordered queue. `SyncOut` returns only items added since the last sync to that peer. `SyncIn` applies items with conflict resolution — older data never overwrites newer data.
+The unified `Sync` method handles both sending and receiving. The `core.StoreSync` implementation uses queue-based incremental sync with timestamp conflict resolution. It implements the `SyncStore` interface and works with the server and client packages.
 
 > [Sync documentation &rarr;](./docs/sync.md)
 
@@ -132,17 +130,17 @@ Every write is recorded in an ordered queue. `SyncOut` returns only items added 
 
 ## Sync Server
 
-WebSocket server for syncing stores over the network. Accepts any `sync.SyncStore` (both `StoreSync` and `StoreMessage`). Run standalone or plug into an existing HTTP server.
+WebSocket server for syncing stores over the network. Accepts any `core.SyncStore` (`StoreSync` or `StoreMessage`). Run standalone or plug into an existing HTTP server.
 
 ```go
 import (
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/sync"
-    "github.com/readmedotmd/store.md/server"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/core"
+    "github.com/readmedotmd/store.md/sync/server"
 )
 
 store, _ := bbolt.New("data.db")
-ss := sync.New(store)
+ss := core.New(store)
 
 srv := server.New(ss, server.TokenAuth(map[string]string{
     "secret-token-1": "peer-1",
@@ -169,17 +167,17 @@ import (
     "fmt"
     gosync "sync"
 
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/sync"
-    "github.com/readmedotmd/store.md/server"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/core"
+    "github.com/readmedotmd/store.md/sync/server"
 )
 
 var (
     mu     gosync.Mutex
-    stores = map[string]sync.SyncStore{}
+    stores = map[string]core.SyncStore{}
 )
 
-resolver := func(storeID string) (sync.SyncStore, error) {
+resolver := func(storeID string) (core.SyncStore, error) {
     mu.Lock()
     defer mu.Unlock()
     if ss, ok := stores[storeID]; ok {
@@ -189,7 +187,7 @@ resolver := func(storeID string) (sync.SyncStore, error) {
     if err != nil {
         return nil, err
     }
-    ss := sync.New(store)
+    ss := core.New(store)
     stores[storeID] = ss
     return ss, nil
 }
@@ -220,13 +218,13 @@ import (
     "net/http"
     "time"
 
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/client"
-    "github.com/readmedotmd/store.md/sync"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/client"
+    "github.com/readmedotmd/store.md/sync/core"
 )
 
 store, _ := bbolt.New("local.db")
-ss := sync.New(store)
+ss := core.New(store)
 
 c := client.New(ss, client.WithInterval(5*time.Second))
 defer c.Close()

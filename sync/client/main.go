@@ -8,14 +8,13 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	storesync "github.com/readmedotmd/store.md/sync"
+	storesync "github.com/readmedotmd/store.md/sync/core"
 )
 
 // Message is the wire format for sync protocol messages.
 type Message struct {
-	Type    string                  `json:"type"`
+	Type    string                 `json:"type"`
 	Payload *storesync.SyncPayload `json:"payload,omitempty"`
-	Limit   string                 `json:"limit,omitempty"`
 	Error   string                 `json:"error,omitempty"`
 }
 
@@ -71,32 +70,29 @@ type managedConn struct {
 	Connection
 	mu     gosync.Mutex // serializes writes
 	done   chan struct{}
-	active bool // true for client-side connections that initiate pulls
+	active bool // true for client-side connections that initiate sync
 }
 
 // Client is a sync adapter that connects a local SyncStore to one or more
-// remote peers via Connections. It handles both client-side and server-side
-// sync protocol roles:
-//   - Receives sync_request -> responds with sync_response (server role)
-//   - Receives sync_push -> SyncIn + responds with sync_ack (server role)
-//   - Receives sync_response -> SyncIn (client role)
-//   - Receives sync_ack -> no-op (client role)
-//   - Receives sync_update -> sends sync_request (client role)
+// remote peers via Connections. It uses the store's Sync method to drive
+// the sync protocol.
+//
+// Protocol messages:
+//   - sync: carries a SyncPayload
+//   - sync_update: notification that the peer has new data
 type Client struct {
 	store    storesync.SyncStore
 	interval time.Duration
-	limit    int
-	pageSize int
 
 	connsMu gosync.RWMutex
 	conns   []*managedConn
 
-	// syncInIDs tracks item IDs currently being processed by SyncIn.
+	// syncInIDs tracks item IDs currently being processed via Sync.
 	// The OnUpdate callback skips items with these IDs to avoid pushing
-	// data back to the peer that just sent it, while still allowing
-	// locally-written items to trigger pushes.
+	// data back to the peer that just sent it.
 	syncInIDs gosync.Map
 
+	wg     gosync.WaitGroup // tracks all background goroutines
 	done   chan struct{}
 	unsub  func()
 	closed bool
@@ -111,37 +107,26 @@ func WithInterval(d time.Duration) Option {
 	return func(c *Client) { c.interval = d }
 }
 
-// WithLimit sets the max items per sync request. Default is 0 (no limit).
-func WithLimit(limit int) Option {
-	return func(c *Client) { c.limit = limit }
-}
-
-// WithPageSize sets the number of items per SyncOut page. Default is 100.
-func WithPageSize(size int) Option {
-	return func(c *Client) { c.pageSize = size }
-}
-
 // New creates a Client that syncs the given store over connections.
 func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
 		store:    store,
 		interval: 5 * time.Second,
-		pageSize: 100,
 		done:     make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(c)
 	}
 
-	// Subscribe to local updates and push to active (client-side) connections.
-	// Skip when the update originated from a connection's SyncIn to avoid
-	// sending data back to the peer that just pushed it.
+	// Subscribe to local updates. On update, initiate sync on active
+	// connections and broadcast sync_update to passive connections.
 	c.unsub = c.store.OnUpdate(func(item storesync.SyncStoreItem) {
 		if _, ok := c.syncInIDs.Load(item.ID); ok {
 			return
 		}
-		go c.pushActive()
-		go c.broadcast(nil)
+		c.wg.Add(2)
+		go func() { defer c.wg.Done(); c.syncActive() }()
+		go func() { defer c.wg.Done(); c.broadcast(nil) }()
 	})
 
 	return c
@@ -149,7 +134,6 @@ func New(store storesync.SyncStore, opts ...Option) *Client {
 
 // Connect dials a remote WebSocket server and starts actively syncing.
 // Can be called multiple times to connect to multiple servers.
-// Active connections send an initial sync_request and run a periodic pull loop.
 func (c *Client) Connect(peerID, url string, header http.Header) error {
 	conn, err := Dial(peerID, url, header)
 	if err != nil {
@@ -160,8 +144,7 @@ func (c *Client) Connect(peerID, url string, header http.Header) error {
 
 // AddConnection adds an existing Connection (e.g. a server-side accepted
 // WebSocket) and starts handling sync messages over it. The connection is
-// passive: it responds to incoming sync_request/sync_push but does not
-// initiate pulls. Use Connect for active client-side connections.
+// passive: it responds to incoming sync messages but does not initiate.
 func (c *Client) AddConnection(conn Connection) error {
 	return c.addConn(conn, false)
 }
@@ -184,14 +167,16 @@ func (c *Client) addConn(conn Connection, active bool) error {
 	c.conns = append(c.conns, mc)
 	c.connsMu.Unlock()
 
-	go c.readLoop(mc)
+	c.wg.Add(1)
+	go func() { defer c.wg.Done(); c.readLoop(mc) }()
 
 	if active {
-		go c.pullLoop(mc)
+		c.wg.Add(1)
+		go func() { defer c.wg.Done(); c.syncLoop(mc) }()
 
-		if err := c.sendSyncRequest(mc); err != nil {
-			log.Printf("sync client: initial pull error: %v", err)
-		}
+		// Initiate first sync immediately.
+		c.wg.Add(1)
+		go func() { defer c.wg.Done(); c.initiateSync(mc) }()
 	}
 
 	return nil
@@ -255,46 +240,34 @@ func (c *Client) Close() error {
 			firstErr = err
 		}
 	}
+
+	c.wg.Wait()
 	return firstErr
 }
 
-// sendSyncRequest asks the remote peer for its latest changes.
-func (c *Client) sendSyncRequest(mc *managedConn) error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	req := Message{Type: "sync_request"}
-	if c.limit > 0 {
-		req.Limit = fmt.Sprintf("%d", c.limit)
+// initiateSync starts a sync exchange on a connection by calling Sync(nil).
+// Always sends a message, even if Sync returns nil, so the remote side gets
+// a chance to respond with its own data.
+func (c *Client) initiateSync(mc *managedConn) {
+	payload, err := c.store.Sync(mc.PeerID(), nil)
+	if err != nil {
+		log.Printf("sync client: initiate error: %v", err)
+		return
 	}
-	return mc.WriteMessage(req)
-}
+	if payload == nil {
+		payload = &storesync.SyncPayload{}
+	}
 
-// sendPush pushes local changes to a single connection, paginating through
-// all pending items using c.pageSize.
-func (c *Client) sendPush(mc *managedConn) error {
 	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	for {
-		payload, err := c.store.SyncOut(mc.PeerID(), c.pageSize)
-		if err != nil {
-			return fmt.Errorf("SyncOut: %w", err)
-		}
-		if len(payload.Items) == 0 {
-			return nil
-		}
-		if err := mc.WriteMessage(Message{Type: "sync_push", Payload: payload}); err != nil {
-			return err
-		}
-		if len(payload.Items) < c.pageSize {
-			return nil
-		}
+	err = mc.WriteMessage(Message{Type: "sync", Payload: payload})
+	mc.mu.Unlock()
+	if err != nil {
+		log.Printf("sync client: send error: %v", err)
 	}
 }
 
-// pushActive pushes local changes to all active (client-side) connections.
-func (c *Client) pushActive() {
+// syncActive initiates sync on all active connections.
+func (c *Client) syncActive() {
 	c.connsMu.RLock()
 	conns := make([]*managedConn, 0, len(c.conns))
 	for _, mc := range c.conns {
@@ -305,9 +278,7 @@ func (c *Client) pushActive() {
 	c.connsMu.RUnlock()
 
 	for _, mc := range conns {
-		if err := c.sendPush(mc); err != nil {
-			log.Printf("sync client: push error: %v", err)
-		}
+		c.initiateSync(mc)
 	}
 }
 
@@ -333,7 +304,7 @@ func (c *Client) broadcast(sender *managedConn) {
 	}
 }
 
-// readLoop reads messages from a connection and handles both client and server roles.
+// readLoop reads messages from a connection and handles them.
 func (c *Client) readLoop(mc *managedConn) {
 	defer c.removeConn(mc)
 	for {
@@ -349,92 +320,50 @@ func (c *Client) readLoop(mc *managedConn) {
 		}
 
 		switch msg.Type {
-		// --- Server role: respond to remote peer's requests ---
-
-		case "sync_request":
-			pageSize := c.pageSize
-			if msg.Limit != "" {
-				var requested int
-				fmt.Sscanf(msg.Limit, "%d", &requested)
-				if requested > 0 && requested < pageSize {
-					pageSize = requested
-				}
-			}
-			mc.mu.Lock()
-			var syncErr error
-			for {
-				payload, err := c.store.SyncOut(mc.PeerID(), pageSize)
-				if err != nil {
-					syncErr = err
-					break
-				}
-				if err := mc.WriteMessage(Message{Type: "sync_response", Payload: payload}); err != nil {
-					syncErr = err
-					break
-				}
-				if len(payload.Items) < pageSize {
-					break
-				}
-			}
-			mc.mu.Unlock()
-			if syncErr != nil {
-				log.Printf("sync client: SyncOut error: %v", syncErr)
-				mc.mu.Lock()
-				mc.WriteMessage(Message{Type: "error", Error: "internal error"})
-				mc.mu.Unlock()
-			}
-
-		case "sync_push":
+		case "sync":
 			if msg.Payload == nil {
-				mc.mu.Lock()
-				mc.WriteMessage(Message{Type: "error", Error: "missing payload"})
-				mc.mu.Unlock()
 				continue
 			}
+
+			// Track incoming item IDs to suppress re-broadcast.
 			for i := range msg.Payload.Items {
 				c.syncInIDs.Store(msg.Payload.Items[i].ID, struct{}{})
 			}
-			err := c.store.SyncIn(mc.PeerID(), *msg.Payload)
+
+			response, err := c.store.Sync(mc.PeerID(), msg.Payload)
+
 			for i := range msg.Payload.Items {
 				c.syncInIDs.Delete(msg.Payload.Items[i].ID)
 			}
+
 			if err != nil {
-				log.Printf("sync client: SyncIn error: %v", err)
+				log.Printf("sync client: Sync error: %v", err)
 				mc.mu.Lock()
 				mc.WriteMessage(Message{Type: "error", Error: "internal error"})
 				mc.mu.Unlock()
 				continue
 			}
-			mc.mu.Lock()
-			mc.WriteMessage(Message{Type: "sync_ack"})
-			mc.mu.Unlock()
-			// Notify other connections that new data is available.
-			c.broadcast(mc)
 
-		// --- Client role: handle responses from remote server ---
-
-		case "sync_response":
-			if msg.Payload != nil {
-				for i := range msg.Payload.Items {
-					c.syncInIDs.Store(msg.Payload.Items[i].ID, struct{}{})
-				}
-				err := c.store.SyncIn(mc.PeerID(), *msg.Payload)
-				for i := range msg.Payload.Items {
-					c.syncInIDs.Delete(msg.Payload.Items[i].ID)
-				}
-				if err != nil {
-					log.Printf("sync client: SyncIn error: %v", err)
-				}
+			// Notify other connections that new data arrived.
+			if len(msg.Payload.Items) > 0 {
+				c.wg.Add(1)
+				go func() { defer c.wg.Done(); c.broadcast(mc) }()
 			}
 
-		case "sync_ack":
-			// Push acknowledged, nothing to do.
+			// Send response if there's data to exchange.
+			if response != nil {
+				mc.mu.Lock()
+				err = mc.WriteMessage(Message{Type: "sync", Payload: response})
+				mc.mu.Unlock()
+				if err != nil {
+					log.Printf("sync client: send error: %v", err)
+				}
+			}
 
 		case "sync_update":
-			// Remote peer has new data — pull it.
-			if err := c.sendSyncRequest(mc); err != nil {
-				log.Printf("sync client: pull on update error: %v", err)
-			}
+			// Remote peer has new data — initiate sync.
+			c.wg.Add(1)
+			go func() { defer c.wg.Done(); c.initiateSync(mc) }()
 
 		case "error":
 			log.Printf("sync client: remote error: %s", msg.Error)
@@ -442,7 +371,8 @@ func (c *Client) readLoop(mc *managedConn) {
 	}
 }
 
-func (c *Client) pullLoop(mc *managedConn) {
+// syncLoop periodically initiates sync on active connections.
+func (c *Client) syncLoop(mc *managedConn) {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
@@ -453,9 +383,7 @@ func (c *Client) pullLoop(mc *managedConn) {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			if err := c.sendSyncRequest(mc); err != nil {
-				log.Printf("sync client: pull error: %v", err)
-			}
+			c.initiateSync(mc)
 		}
 	}
 }

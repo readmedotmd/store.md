@@ -10,7 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	storemd "github.com/readmedotmd/store.md"
-	"github.com/readmedotmd/store.md/sync"
+	"github.com/readmedotmd/store.md/sync/core"
 )
 
 // Envelope is the wire format for messages and responses.
@@ -43,7 +43,7 @@ const (
 
 // StoreMessage adds request/response messaging on top of a sync store.
 type StoreMessage struct {
-	ss *sync.StoreSync
+	ss *core.StoreSync
 	id string
 
 	handlersMu gosync.RWMutex
@@ -60,7 +60,7 @@ type StoreMessage struct {
 }
 
 // New creates a StoreMessage with the given unique ID.
-func New(syncStore *sync.StoreSync, id string) *StoreMessage {
+func New(syncStore *core.StoreSync, id string) *StoreMessage {
 	m := &StoreMessage{
 		ss:        syncStore,
 		id:        id,
@@ -78,7 +78,7 @@ func (m *StoreMessage) ID() string {
 }
 
 // SyncStore returns the underlying StoreSync.
-func (m *StoreMessage) SyncStore() *sync.StoreSync {
+func (m *StoreMessage) SyncStore() *core.StoreSync {
 	return m.ss
 }
 
@@ -105,12 +105,11 @@ func (m *StoreMessage) List(args storemd.ListArgs) ([]storemd.KeyValuePair, erro
 
 // --- Sync store methods ---
 
-func (m *StoreMessage) GetItem(key string) (*sync.SyncStoreItem, error)               { return m.ss.GetItem(key) }
+func (m *StoreMessage) GetItem(key string) (*core.SyncStoreItem, error)               { return m.ss.GetItem(key) }
 func (m *StoreMessage) SetItem(app, key, value string) error                          { return m.ss.SetItem(app, key, value) }
-func (m *StoreMessage) ListItems(prefix, startAfter string, limit int) ([]sync.SyncStoreItem, error) { return m.ss.ListItems(prefix, startAfter, limit) }
-func (m *StoreMessage) OnUpdate(fn sync.UpdateListener) func()                        { return m.ss.OnUpdate(fn) }
-func (m *StoreMessage) SyncIn(peerID string, payload sync.SyncPayload) error          { return m.ss.SyncIn(peerID, payload) }
-func (m *StoreMessage) SyncOut(peerID string, limit int) (*sync.SyncPayload, error)   { return m.ss.SyncOut(peerID, limit) }
+func (m *StoreMessage) ListItems(prefix, startAfter string, limit int) ([]core.SyncStoreItem, error) { return m.ss.ListItems(prefix, startAfter, limit) }
+func (m *StoreMessage) OnUpdate(fn core.UpdateListener) func()                        { return m.ss.OnUpdate(fn) }
+func (m *StoreMessage) Sync(peerID string, incoming *core.SyncPayload) (*core.SyncPayload, error) { return m.ss.Sync(peerID, incoming) }
 
 // --- Messaging API ---
 
@@ -196,7 +195,7 @@ func (m *StoreMessage) sendResponse(messageID, data, errMsg string) error {
 	return m.ss.SetItem("msg", resKey(messageID), string(encoded))
 }
 
-func (m *StoreMessage) onSyncUpdate(item sync.SyncStoreItem) {
+func (m *StoreMessage) onSyncUpdate(item core.SyncStoreItem) {
 	key := item.Key
 
 	// Incoming request addressed to us
@@ -259,4 +258,4 @@ func (m *StoreMessage) notifyMessageListeners(env Envelope) {
 	}
 }
 
-var _ sync.SyncStore = (*StoreMessage)(nil)
+var _ core.SyncStore = (*StoreMessage)(nil)

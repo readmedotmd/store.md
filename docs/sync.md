@@ -1,6 +1,6 @@
 # Sync Store
 
-The `sync` package wraps any `Store` implementation with a synchronization layer. It enables peer-to-peer data replication with timestamp-based conflict resolution.
+The `sync/core` package wraps any `Store` implementation with a synchronization layer. It enables peer-to-peer data replication with timestamp-based conflict resolution.
 
 ## How It Works
 
@@ -16,7 +16,7 @@ The queue enables efficient incremental sync — peers track their cursor positi
 
 ## SyncStore Interface
 
-The `sync` package defines a `SyncStore` interface that captures the full sync-capable API. Both `StoreSync` and `StoreMessage` implement it:
+The `sync/core` package defines a `SyncStore` interface that captures the full sync-capable API. All sync store implementations (`StoreSync`, `StoreMessage`) implement it:
 
 ```go
 type SyncStore interface {
@@ -25,21 +25,20 @@ type SyncStore interface {
     SetItem(app, key, value string) error
     ListItems(prefix, startAfter string, limit int) ([]SyncStoreItem, error)
     OnUpdate(fn UpdateListener) func()
-    SyncIn(peerID string, payload SyncPayload) error
-    SyncOut(peerID string, limit int) (*SyncPayload, error)
+    Sync(peerID string, incoming *SyncPayload) (*SyncPayload, error)
 }
 ```
 
-This interface is used by the server and client adapter packages, allowing them to work with either a `StoreSync` or a `StoreMessage` interchangeably.
+The `Sync` method drives the sync protocol. The server and client packages work with any `SyncStore`.
 
 ## Store Interface
 
 `StoreSync` implements both `storemd.Store` and `SyncStore`, so it can be used anywhere either interface is expected:
 
 ```go
-ss := sync.New(store)
+ss := core.New(store)
 var _ storemd.Store = ss    // compiles
-var _ sync.SyncStore = ss   // compiles
+var _ core.SyncStore = ss   // compiles
 
 ss.Set("greeting", "hello world")    // Store interface
 val, _ := ss.Get("greeting")         // returns string
@@ -49,14 +48,14 @@ val, _ := ss.Get("greeting")         // returns string
 
 ```go
 import (
-    "github.com/readmedotmd/store.md/bbolt"
-    "github.com/readmedotmd/store.md/sync"
+    "github.com/readmedotmd/store.md/backend/bbolt"
+    "github.com/readmedotmd/store.md/sync/core"
 )
 
 store, _ := bbolt.New("data.db")
 defer store.Close()
 
-ss := sync.New(store)
+ss := core.New(store)
 
 // Write with sync metadata
 ss.SetItem("myapp", "greeting", "hello world")
@@ -66,7 +65,7 @@ item, err := ss.GetItem("greeting")
 // item.App, item.Key, item.Value, item.Timestamp, item.ID
 
 // List items
-items, _ := ss.ListItems("", "", "")
+items, _ := ss.ListItems("", "", 0)
 ```
 
 ## SyncStoreItem
@@ -91,7 +90,7 @@ When setting a value, the sync store checks if an existing item has a newer `Tim
 
 ## Deletes
 
-`Delete` writes a **tombstone** — a `SyncStoreItem` with `Deleted: true` and an empty value. Tombstones enter the sync queue like any other write and propagate to all peers via `SyncOut`/`SyncIn`.
+`Delete` writes a **tombstone** — a `SyncStoreItem` with `Deleted: true` and an empty value. Tombstones sync like any other write and propagate to all peers.
 
 ```go
 ss.SetItem("app", "config", "value")
@@ -108,38 +107,41 @@ Tombstones participate in conflict resolution — a delete with an older timesta
 
 ## Syncing Between Peers
 
-### SyncOut — Send data to a peer
+The `Sync` method handles both sending and receiving data in a single call:
 
 ```go
-payload, err := store1.SyncOut("peer-2-id", "100") // limit 100 items
-// payload.Items contains the items to send
-// payload.LastSyncTimestamp is the cursor position
+// Initiate a sync exchange (no incoming data)
+payload, err := store1.Sync("peer-2-id", nil)
+// payload contains items to send to the peer
+
+// Process received data and respond
+response, err := store2.Sync("peer-1-id", payload)
+// response contains items to send back (nil when done)
 ```
 
-`SyncOut` tracks per-peer cursors internally. Each call returns only items added since the last sync to that peer.
-
-### SyncIn — Receive data from a peer
-
-```go
-err := store2.SyncIn("peer-1-id", payload)
-```
-
-Each item goes through the same conflict resolution — older items won't overwrite newer local data.
+Each call to `Sync` with incoming data applies items through conflict resolution — older items won't overwrite newer local data. When `Sync` returns nil, the exchange is complete.
 
 ### Full Example
 
 ```go
 store1, _ := bbolt.New("node1.db")
 store2, _ := bbolt.New("node2.db")
-sync1 := sync.New(store1)
-sync2 := sync.New(store2)
+sync1 := core.New(store1)
+sync2 := core.New(store2)
 
 // Node 1 writes data
 sync1.SetItem("app", "config", `{"theme":"dark"}`)
 
-// Node 1 sends to Node 2
-payload, _ := sync1.SyncOut("node2", "")
-sync2.SyncIn("node1", *payload)
+// Node 1 initiates sync
+outgoing, _ := sync1.Sync("node2", nil)
+
+// Node 2 processes and responds
+response, _ := sync2.Sync("node1", outgoing)
+
+// Node 1 processes response (if any)
+if response != nil {
+    sync1.Sync("node2", response)
+}
 
 // Node 2 now has the data
 item, _ := sync2.GetItem("config")
@@ -148,10 +150,10 @@ fmt.Println(item.Value) // {"theme":"dark"}
 
 ## Update Listeners
 
-Register callbacks that fire whenever an item is successfully written — via `SetItem` or `SyncIn`. Writes that are rejected by conflict resolution (older timestamp) do not trigger listeners.
+Register callbacks that fire whenever an item is successfully written — via `SetItem` or `Sync`. Writes that are rejected by conflict resolution (older timestamp) do not trigger listeners.
 
 ```go
-unsub := ss.OnUpdate(func(item sync.SyncStoreItem) {
+unsub := ss.OnUpdate(func(item core.SyncStoreItem) {
     fmt.Printf("updated: %s = %s\n", item.Key, item.Value)
 })
 
@@ -171,16 +173,15 @@ unsub()
 The `StoreSync` constructor accepts an optional time offset (in nanoseconds):
 
 ```go
-ss := sync.New(store, int64(10 * time.Second)) // default: 10 seconds
+ss := core.New(store, int64(10 * time.Second)) // default: 10 seconds
 ```
 
 The offset is added to `time.Now()` to compute `WriteTimestamp`. This creates a buffer window — items written within the offset period are considered "in-flight" and won't advance the sync cursor until their write time has passed. This prevents items from being skipped during concurrent writes.
 
 ## Per-Peer Cursors
 
-SyncIn and SyncOut maintain independent timestamp cursors per peer:
+SyncOut maintains per-peer timestamp cursors:
 
-- `%sync%lastsyncin%{peerID}` — tracks the last timestamp received from a peer
 - `%sync%lastsyncout%{peerID}` — tracks the last timestamp sent to a peer
 
 This means syncing with peer A doesn't affect the cursor for peer B.
