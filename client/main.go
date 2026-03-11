@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 	gosync "sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -92,10 +91,11 @@ type Client struct {
 	connsMu gosync.RWMutex
 	conns   []*managedConn
 
-	// inSyncIn tracks how many readLoop goroutines are currently processing
-	// a sync_push (calling SyncIn). When > 0, the OnUpdate callback skips
-	// pushing to avoid feedback loops.
-	inSyncIn atomic.Int32
+	// syncInIDs tracks item IDs currently being processed by SyncIn.
+	// The OnUpdate callback skips items with these IDs to avoid pushing
+	// data back to the peer that just sent it, while still allowing
+	// locally-written items to trigger pushes.
+	syncInIDs gosync.Map
 
 	done   chan struct{}
 	unsub  func()
@@ -137,10 +137,11 @@ func New(store storesync.SyncStore, opts ...Option) *Client {
 	// Skip when the update originated from a connection's SyncIn to avoid
 	// sending data back to the peer that just pushed it.
 	c.unsub = c.store.OnUpdate(func(item storesync.SyncStoreItem) {
-		if c.inSyncIn.Load() > 0 {
+		if _, ok := c.syncInIDs.Load(item.ID); ok {
 			return
 		}
 		go c.pushActive()
+		go c.broadcast(nil)
 	})
 
 	return c
@@ -390,9 +391,13 @@ func (c *Client) readLoop(mc *managedConn) {
 				mc.mu.Unlock()
 				continue
 			}
-			c.inSyncIn.Add(1)
+			for i := range msg.Payload.Items {
+				c.syncInIDs.Store(msg.Payload.Items[i].ID, struct{}{})
+			}
 			err := c.store.SyncIn(mc.PeerID(), *msg.Payload)
-			c.inSyncIn.Add(-1)
+			for i := range msg.Payload.Items {
+				c.syncInIDs.Delete(msg.Payload.Items[i].ID)
+			}
 			if err != nil {
 				log.Printf("sync client: SyncIn error: %v", err)
 				mc.mu.Lock()
@@ -410,9 +415,13 @@ func (c *Client) readLoop(mc *managedConn) {
 
 		case "sync_response":
 			if msg.Payload != nil {
-				c.inSyncIn.Add(1)
+				for i := range msg.Payload.Items {
+					c.syncInIDs.Store(msg.Payload.Items[i].ID, struct{}{})
+				}
 				err := c.store.SyncIn(mc.PeerID(), *msg.Payload)
-				c.inSyncIn.Add(-1)
+				for i := range msg.Payload.Items {
+					c.syncInIDs.Delete(msg.Payload.Items[i].ID)
+				}
 				if err != nil {
 					log.Printf("sync client: SyncIn error: %v", err)
 				}
