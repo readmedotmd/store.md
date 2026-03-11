@@ -3,8 +3,8 @@ name: Banner
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/banner.yml
+    paths-ignore:
+      - '.github/banner.svg'
   workflow_dispatch:
 
 permissions:
@@ -14,20 +14,40 @@ jobs:
   generate:
     name: Generate Banner
     runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate banner SVG
+      - name: Extract version
+        id: version
         run: |
-          curl -sf -o .github/banner.svg \
-            -H "X-API-Key: ${{ secrets.STYLEMD_API_KEY }}" \
-            "https://faas-lon1-917a94a7.doserverless.co/api/v1/web/fn-38e8948f-7a79-4b9d-af0e-f6399470d7be/generate/svg?type=root"
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo 'v0.0.0')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate banner
+        env:
+          GENERATE_URL: ${{ secrets.STYLEMD_GENERATE_URL }}
+          API_KEY: ${{ secrets.STYLEMD_API_KEY }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_DESC: ${{ github.event.repository.description }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p .github
+          curl -sfG "$GENERATE_URL" \
+            --data-urlencode "api_key=$API_KEY" \
+            --data-urlencode "name=$REPO_NAME" \
+            --data-urlencode "tagline=$REPO_DESC" \
+            --data-urlencode "version=$VERSION" \
+            -o .github/banner.svg
 
       - name: Commit banner
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .github/banner.svg
-          git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "Update banner image"
-          git push
+          if git diff --cached --quiet; then
+            echo 'No changes to commit'
+          else
+            git commit -m 'Update banner [skip ci]'
+            git push
+          fi
