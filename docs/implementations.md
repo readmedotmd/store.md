@@ -160,3 +160,16 @@ Values are stored in a `kv` object store. Cursor iteration provides lexicographi
 **Best for:** Browser apps, PWAs, offline-first web applications.
 
 **Note:** Requires `GOOS=js GOARCH=wasm` build target. Tests need a browser or JS runtime with IndexedDB support.
+
+---
+
+## Sync Implementations
+
+Two `SyncStore` implementations are available, both wrapping any `Store`:
+
+| Package | Description |
+|---------|-------------|
+| `sync/` | Queue-based sync with timestamp conflict resolution. See [sync.md](sync.md). |
+| `fingerprintsync/` | Queue-based sync + XOR fingerprint reconciliation for mesh topologies. See [fingerprintsync.md](fingerprintsync.md). |
+
+Both implement the `sync.SyncStore` interface and can be used interchangeably with the server and client packages.
