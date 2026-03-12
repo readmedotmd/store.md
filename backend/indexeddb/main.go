@@ -3,6 +3,7 @@
 package indexeddb
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"syscall/js"
@@ -33,7 +34,7 @@ func (s *StoreIndexedDB) Close() error {
 	return nil
 }
 
-func (s *StoreIndexedDB) Get(key string) (string, error) {
+func (s *StoreIndexedDB) Get(ctx context.Context, key string) (string, error) {
 	type result struct {
 		val string
 		err error
@@ -59,7 +60,7 @@ func (s *StoreIndexedDB) Get(key string) (string, error) {
 	return r.val, r.err
 }
 
-func (s *StoreIndexedDB) Set(key, value string) error {
+func (s *StoreIndexedDB) Set(ctx context.Context, key, value string) error {
 	ch := make(chan error, 1)
 	go func() {
 		tx := s.db.Call("transaction", s.storeName, "readwrite")
@@ -70,9 +71,9 @@ func (s *StoreIndexedDB) Set(key, value string) error {
 	return <-ch
 }
 
-func (s *StoreIndexedDB) Delete(key string) error {
+func (s *StoreIndexedDB) Delete(ctx context.Context, key string) error {
 	// Check existence first — IndexedDB delete is a no-op for missing keys.
-	_, err := s.Get(key)
+	_, err := s.Get(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -87,7 +88,7 @@ func (s *StoreIndexedDB) Delete(key string) error {
 	return <-ch
 }
 
-func (s *StoreIndexedDB) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreIndexedDB) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	type result struct {
 		items []storemd.KeyValuePair
 		err   error

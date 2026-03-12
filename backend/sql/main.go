@@ -1,6 +1,7 @@
 package sqlstore
 
 import (
+	"context"
 	"database/sql"
 
 	storemd "github.com/readmedotmd/store.md"
@@ -28,9 +29,9 @@ func (s *StoreSQL) init() error {
 	return err
 }
 
-func (s *StoreSQL) Get(key string) (string, error) {
+func (s *StoreSQL) Get(ctx context.Context, key string) (string, error) {
 	var value string
-	err := s.db.QueryRow("SELECT value FROM kv_store WHERE key = ?", key).Scan(&value)
+	err := s.db.QueryRowContext(ctx, "SELECT value FROM kv_store WHERE key = ?", key).Scan(&value)
 	if err == sql.ErrNoRows {
 		return "", storemd.NotFoundError
 	}
@@ -40,16 +41,16 @@ func (s *StoreSQL) Get(key string) (string, error) {
 	return value, nil
 }
 
-func (s *StoreSQL) Set(key, value string) error {
-	_, err := s.db.Exec(
+func (s *StoreSQL) Set(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx,
 		"INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 		key, value,
 	)
 	return err
 }
 
-func (s *StoreSQL) Delete(key string) error {
-	result, err := s.db.Exec("DELETE FROM kv_store WHERE key = ?", key)
+func (s *StoreSQL) Delete(ctx context.Context, key string) error {
+	result, err := s.db.ExecContext(ctx, "DELETE FROM kv_store WHERE key = ?", key)
 	if err != nil {
 		return err
 	}
@@ -63,7 +64,7 @@ func (s *StoreSQL) Delete(key string) error {
 	return nil
 }
 
-func (s *StoreSQL) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreSQL) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	query := "SELECT key, value FROM kv_store"
 	var queryArgs []interface{}
 	var conditions []string
@@ -93,7 +94,7 @@ func (s *StoreSQL) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 		queryArgs = append(queryArgs, args.Limit)
 	}
 
-	rows, err := s.db.Query(query, queryArgs...)
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return nil, err
 	}

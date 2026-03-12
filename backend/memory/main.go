@@ -3,6 +3,7 @@
 package memory
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +22,7 @@ func New() *StoreMemory {
 	return &StoreMemory{data: make(map[string]string)}
 }
 
-func (s *StoreMemory) Get(key string) (string, error) {
+func (s *StoreMemory) Get(ctx context.Context, key string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.data[key]
@@ -31,14 +32,14 @@ func (s *StoreMemory) Get(key string) (string, error) {
 	return v, nil
 }
 
-func (s *StoreMemory) Set(key, value string) error {
+func (s *StoreMemory) Set(ctx context.Context, key, value string) error {
 	s.mu.Lock()
 	s.data[key] = value
 	s.mu.Unlock()
 	return nil
 }
 
-func (s *StoreMemory) Delete(key string) error {
+func (s *StoreMemory) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.data[key]; !ok {
@@ -48,7 +49,7 @@ func (s *StoreMemory) Delete(key string) error {
 	return nil
 }
 
-func (s *StoreMemory) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreMemory) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

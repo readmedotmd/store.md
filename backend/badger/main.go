@@ -1,6 +1,7 @@
 package badger
 
 import (
+	"context"
 	"strings"
 
 	storemd "github.com/readmedotmd/store.md"
@@ -29,7 +30,7 @@ func (s *StoreBadger) Close() error {
 	return s.db.Close()
 }
 
-func (s *StoreBadger) Get(key string) (string, error) {
+func (s *StoreBadger) Get(ctx context.Context, key string) (string, error) {
 	var val string
 	err := s.db.View(func(txn *badgerdb.Txn) error {
 		item, err := txn.Get([]byte(key))
@@ -49,13 +50,13 @@ func (s *StoreBadger) Get(key string) (string, error) {
 	return val, err
 }
 
-func (s *StoreBadger) Set(key, value string) error {
+func (s *StoreBadger) Set(ctx context.Context, key, value string) error {
 	return s.db.Update(func(txn *badgerdb.Txn) error {
 		return txn.Set([]byte(key), []byte(value))
 	})
 }
 
-func (s *StoreBadger) Delete(key string) error {
+func (s *StoreBadger) Delete(ctx context.Context, key string) error {
 	return s.db.Update(func(txn *badgerdb.Txn) error {
 		// Check if key exists first.
 		_, err := txn.Get([]byte(key))
@@ -69,7 +70,7 @@ func (s *StoreBadger) Delete(key string) error {
 	})
 }
 
-func (s *StoreBadger) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreBadger) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	var result []storemd.KeyValuePair
 	err := s.db.View(func(txn *badgerdb.Txn) error {
 		opts := badgerdb.DefaultIteratorOptions

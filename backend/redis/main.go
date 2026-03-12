@@ -5,10 +5,20 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	storemd "github.com/readmedotmd/store.md"
 	"github.com/redis/go-redis/v9"
 )
+
+const defaultTimeout = 30 * time.Second
+
+func withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
+}
 
 // StoreRedis implements storemd.StoreRedis using Redis.
 type StoreRedis struct {
@@ -33,8 +43,9 @@ func (s *StoreRedis) userKey(redisKey string) string {
 	return strings.TrimPrefix(redisKey, s.prefix)
 }
 
-func (s *StoreRedis) Get(key string) (string, error) {
-	ctx := context.Background()
+func (s *StoreRedis) Get(ctx context.Context, key string) (string, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	val, err := s.client.Get(ctx, s.redisKey(key)).Result()
 	if err == redis.Nil {
 		return "", storemd.NotFoundError
@@ -45,13 +56,15 @@ func (s *StoreRedis) Get(key string) (string, error) {
 	return val, nil
 }
 
-func (s *StoreRedis) Set(key, value string) error {
-	ctx := context.Background()
+func (s *StoreRedis) Set(ctx context.Context, key, value string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	return s.client.Set(ctx, s.redisKey(key), value, 0).Err()
 }
 
-func (s *StoreRedis) Delete(key string) error {
-	ctx := context.Background()
+func (s *StoreRedis) Delete(ctx context.Context, key string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	n, err := s.client.Del(ctx, s.redisKey(key)).Result()
 	if err != nil {
 		return err
@@ -62,8 +75,9 @@ func (s *StoreRedis) Delete(key string) error {
 	return nil
 }
 
-func (s *StoreRedis) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	ctx := context.Background()
+func (s *StoreRedis) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 
 	// Build SCAN match pattern
 	matchPattern := s.prefix + args.Prefix + "*"

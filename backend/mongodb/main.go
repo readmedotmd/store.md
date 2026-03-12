@@ -3,6 +3,7 @@ package mongodb
 import (
 	"context"
 	"regexp"
+	"time"
 
 	storemd "github.com/readmedotmd/store.md"
 
@@ -10,6 +11,15 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+const defaultTimeout = 30 * time.Second
+
+func withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
+}
 
 type document struct {
 	ID    string `bson:"_id"`
@@ -24,9 +34,11 @@ func New(col *mongo.Collection) *StoreMongo {
 	return &StoreMongo{col: col}
 }
 
-func (s *StoreMongo) Get(key string) (string, error) {
+func (s *StoreMongo) Get(ctx context.Context, key string) (string, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	var doc document
-	err := s.col.FindOne(context.Background(), bson.M{"_id": key}).Decode(&doc)
+	err := s.col.FindOne(ctx, bson.M{"_id": key}).Decode(&doc)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return "", storemd.NotFoundError
@@ -36,10 +48,12 @@ func (s *StoreMongo) Get(key string) (string, error) {
 	return doc.Value, nil
 }
 
-func (s *StoreMongo) Set(key, value string) error {
+func (s *StoreMongo) Set(ctx context.Context, key, value string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
 	opts := options.Replace().SetUpsert(true)
 	_, err := s.col.ReplaceOne(
-		context.Background(),
+		ctx,
 		bson.M{"_id": key},
 		document{ID: key, Value: value},
 		opts,
@@ -47,8 +61,10 @@ func (s *StoreMongo) Set(key, value string) error {
 	return err
 }
 
-func (s *StoreMongo) Delete(key string) error {
-	result, err := s.col.DeleteOne(context.Background(), bson.M{"_id": key})
+func (s *StoreMongo) Delete(ctx context.Context, key string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	result, err := s.col.DeleteOne(ctx, bson.M{"_id": key})
 	if err != nil {
 		return err
 	}
@@ -58,7 +74,10 @@ func (s *StoreMongo) Delete(key string) error {
 	return nil
 }
 
-func (s *StoreMongo) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreMongo) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
 	filter := bson.M{}
 
 	if args.Prefix != "" {
@@ -83,14 +102,14 @@ func (s *StoreMongo) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error)
 		opts.SetLimit(int64(args.Limit))
 	}
 
-	cursor, err := s.col.Find(context.Background(), filter, opts)
+	cursor, err := s.col.Find(ctx, filter, opts)
 	if err != nil {
 		return nil, err
 	}
-	defer cursor.Close(context.Background())
+	defer cursor.Close(ctx)
 
 	var results []storemd.KeyValuePair
-	for cursor.Next(context.Background()) {
+	for cursor.Next(ctx) {
 		var doc document
 		if err := cursor.Decode(&doc); err != nil {
 			return nil, err

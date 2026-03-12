@@ -1,6 +1,10 @@
 package storemd
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -9,20 +13,22 @@ type StoreFactory func(t *testing.T) Store
 
 // RunStoreTests runs the full generic test suite against any Store implementation.
 func RunStoreTests(t *testing.T, factory StoreFactory) {
+	ctx := context.Background()
+
 	t.Run("Get_NotFound", func(t *testing.T) {
 		s := factory(t)
-		_, err := s.Get("nonexistent")
-		if err != NotFoundError {
-			t.Fatalf("expected NotFoundError, got %v", err)
+		_, err := s.Get(ctx, "nonexistent")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
 		}
 	})
 
 	t.Run("SetAndGet", func(t *testing.T) {
 		s := factory(t)
-		if err := s.Set("key1", "value1"); err != nil {
+		if err := s.Set(ctx, "key1", "value1"); err != nil {
 			t.Fatalf("Set failed: %v", err)
 		}
-		val, err := s.Get("key1")
+		val, err := s.Get(ctx, "key1")
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
@@ -33,13 +39,13 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 
 	t.Run("Set_Overwrite", func(t *testing.T) {
 		s := factory(t)
-		if err := s.Set("key1", "value1"); err != nil {
+		if err := s.Set(ctx, "key1", "value1"); err != nil {
 			t.Fatalf("Set failed: %v", err)
 		}
-		if err := s.Set("key1", "value2"); err != nil {
+		if err := s.Set(ctx, "key1", "value2"); err != nil {
 			t.Fatalf("Set overwrite failed: %v", err)
 		}
-		val, err := s.Get("key1")
+		val, err := s.Get(ctx, "key1")
 		if err != nil {
 			t.Fatalf("Get failed: %v", err)
 		}
@@ -50,29 +56,29 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 
 	t.Run("Delete", func(t *testing.T) {
 		s := factory(t)
-		if err := s.Set("key1", "value1"); err != nil {
+		if err := s.Set(ctx, "key1", "value1"); err != nil {
 			t.Fatalf("Set failed: %v", err)
 		}
-		if err := s.Delete("key1"); err != nil {
+		if err := s.Delete(ctx, "key1"); err != nil {
 			t.Fatalf("Delete failed: %v", err)
 		}
-		_, err := s.Get("key1")
-		if err != NotFoundError {
-			t.Fatalf("expected NotFoundError after delete, got %v", err)
+		_, err := s.Get(ctx, "key1")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound after delete, got %v", err)
 		}
 	})
 
 	t.Run("Delete_NotFound", func(t *testing.T) {
 		s := factory(t)
-		err := s.Delete("nonexistent")
-		if err != NotFoundError {
-			t.Fatalf("expected NotFoundError, got %v", err)
+		err := s.Delete(ctx, "nonexistent")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got %v", err)
 		}
 	})
 
 	t.Run("List_Empty", func(t *testing.T) {
 		s := factory(t)
-		result, err := s.List(ListArgs{})
+		result, err := s.List(ctx, ListArgs{})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -89,11 +95,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"b/1", "v3"},
 		}
 		for _, p := range pairs {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{})
+		result, err := s.List(ctx, ListArgs{})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -109,11 +115,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"a/2", "v2"},
 			{"b/1", "v3"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{Prefix: "a/"})
+		result, err := s.List(ctx, ListArgs{Prefix: "a/"})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -134,11 +140,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"b", "v2"},
 			{"c", "v3"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{StartAfter: "a"})
+		result, err := s.List(ctx, ListArgs{StartAfter: "a"})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -159,11 +165,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"b", "v2"},
 			{"c", "v3"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{Limit: 2})
+		result, err := s.List(ctx, ListArgs{Limit: 2})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -180,13 +186,13 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"c", "v3"},
 			{"d", "v4"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
 
 		// First page
-		page1, err := s.List(ListArgs{Limit: 2})
+		page1, err := s.List(ctx, ListArgs{Limit: 2})
 		if err != nil {
 			t.Fatalf("List page1 failed: %v", err)
 		}
@@ -196,7 +202,7 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 
 		// Second page using StartAfter with last key from page1
 		lastKey := page1[len(page1)-1].Key
-		page2, err := s.List(ListArgs{Limit: 2, StartAfter: lastKey})
+		page2, err := s.List(ctx, ListArgs{Limit: 2, StartAfter: lastKey})
 		if err != nil {
 			t.Fatalf("List page2 failed: %v", err)
 		}
@@ -222,11 +228,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"a", "v1"},
 			{"b", "v2"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{})
+		result, err := s.List(ctx, ListArgs{})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -246,11 +252,11 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 			{"x/d", "v4"},
 			{"y/a", "v5"},
 		} {
-			if err := s.Set(p.Key, p.Value); err != nil {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
 				t.Fatalf("Set %q failed: %v", p.Key, err)
 			}
 		}
-		result, err := s.List(ListArgs{Prefix: "x/", StartAfter: "x/b", Limit: 2})
+		result, err := s.List(ctx, ListArgs{Prefix: "x/", StartAfter: "x/b", Limit: 2})
 		if err != nil {
 			t.Fatalf("List failed: %v", err)
 		}
@@ -259,6 +265,84 @@ func RunStoreTests(t *testing.T, factory StoreFactory) {
 		}
 		if result[0].Key != "x/c" || result[1].Key != "x/d" {
 			t.Fatalf("expected [x/c, x/d], got [%s, %s]", result[0].Key, result[1].Key)
+		}
+	})
+
+	t.Run("Concurrent_ReadWrite", func(t *testing.T) {
+		s := factory(t)
+		ctx := context.Background()
+		var wg sync.WaitGroup
+		for i := range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				key := fmt.Sprintf("concurrent-%d", i)
+				if err := s.Set(ctx, key, "value"); err != nil {
+					t.Errorf("Set %q failed: %v", key, err)
+				}
+				if _, err := s.Get(ctx, key); err != nil {
+					t.Errorf("Get %q failed: %v", key, err)
+				}
+			}()
+		}
+		wg.Wait()
+		result, err := s.List(ctx, ListArgs{Prefix: "concurrent-"})
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		if len(result) != 10 {
+			t.Fatalf("expected 10 items, got %d", len(result))
+		}
+	})
+
+	t.Run("EmptyKey", func(t *testing.T) {
+		s := factory(t)
+		ctx := context.Background()
+		if err := s.Set(ctx, "", "value"); err != nil {
+			t.Skipf("backend does not support empty keys: %v", err)
+		}
+		val, err := s.Get(ctx, "")
+		if err != nil {
+			t.Fatalf("Get empty key failed: %v", err)
+		}
+		if val != "value" {
+			t.Fatalf("expected %q, got %q", "value", val)
+		}
+	})
+
+	t.Run("SpecialCharacters", func(t *testing.T) {
+		s := factory(t)
+		ctx := context.Background()
+		keys := []string{"key/with/slashes", "key with spaces", "key%percent", "key🔑emoji", "a/b/c/d/e"}
+		for _, key := range keys {
+			if err := s.Set(ctx, key, "v"); err != nil {
+				t.Errorf("Set %q failed: %v", key, err)
+				continue
+			}
+			val, err := s.Get(ctx, key)
+			if err != nil {
+				t.Errorf("Get %q failed: %v", key, err)
+				continue
+			}
+			if val != "v" {
+				t.Errorf("key %q: expected %q, got %q", key, "v", val)
+			}
+		}
+	})
+
+	t.Run("LargeValue", func(t *testing.T) {
+		s := factory(t)
+		ctx := context.Background()
+		large := string(make([]byte, 1024*1024)) // 1MB of null bytes
+		if err := s.Set(ctx, "large", large); err != nil {
+			t.Skipf("backend does not support 1MB values: %v", err)
+		}
+		val, err := s.Get(ctx, "large")
+		if err != nil {
+			t.Fatalf("Get large value failed: %v", err)
+		}
+		if len(val) != len(large) {
+			t.Fatalf("expected %d bytes, got %d", len(large), len(val))
 		}
 	})
 }

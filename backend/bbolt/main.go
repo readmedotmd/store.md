@@ -1,6 +1,7 @@
 package bbolt
 
 import (
+	"context"
 	"strings"
 
 	storemd "github.com/readmedotmd/store.md"
@@ -38,7 +39,7 @@ func (s *StoreBBolt) Close() error {
 	return s.db.Close()
 }
 
-func (s *StoreBBolt) Get(key string) (string, error) {
+func (s *StoreBBolt) Get(ctx context.Context, key string) (string, error) {
 	var value string
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
@@ -52,14 +53,14 @@ func (s *StoreBBolt) Get(key string) (string, error) {
 	return value, err
 }
 
-func (s *StoreBBolt) Set(key, value string) error {
+func (s *StoreBBolt) Set(ctx context.Context, key, value string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		return b.Put([]byte(key), []byte(value))
 	})
 }
 
-func (s *StoreBBolt) Delete(key string) error {
+func (s *StoreBBolt) Delete(ctx context.Context, key string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
 		v := b.Get([]byte(key))
@@ -70,7 +71,7 @@ func (s *StoreBBolt) Delete(key string) error {
 	})
 }
 
-func (s *StoreBBolt) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreBBolt) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	var result []storemd.KeyValuePair
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)
