@@ -2,7 +2,7 @@
 
 ## Generic Test Suite
 
-The `storemd.RunStoreTests` function provides a reusable test suite for any `Store` implementation. It runs 14 tests covering all interface methods.
+The `storemd.RunStoreTests` function provides a reusable test suite for any `Store` implementation. It covers all interface methods, including concurrent access tests to verify thread safety.
 
 ### Usage
 
@@ -26,11 +26,11 @@ The factory function is called once per sub-test, so each test gets an isolated 
 
 | Test | What it verifies |
 |------|-----------------|
-| `Get_NotFound` | Returns `NotFoundError` for missing keys |
+| `Get_NotFound` | Returns `ErrNotFound` for missing keys |
 | `SetAndGet` | Basic write then read |
 | `Set_Overwrite` | Writing to an existing key replaces the value |
 | `Delete` | Deleting a key makes it not found |
-| `Delete_NotFound` | Deleting a missing key returns `NotFoundError` |
+| `Delete_NotFound` | Deleting a missing key returns `ErrNotFound` |
 | `List_Empty` | Empty store returns empty slice |
 | `List_All` | Returns all stored items |
 | `List_Prefix` | Filters by key prefix |
@@ -39,12 +39,13 @@ The factory function is called once per sub-test, so each test gets an isolated 
 | `List_Pagination` | Two pages with no overlap |
 | `List_OrderedByKey` | Results are sorted lexicographically |
 | `List_PrefixWithStartAfterAndLimit` | All three List params combined |
+| `ConcurrentAccess` | Concurrent reads and writes are safe |
 
 ### Requirements for Passing
 
 Your implementation must:
 
-1. Return `storemd.NotFoundError` (not a wrapped or different error) from `Get` and `Delete` when the key doesn't exist
+1. Return `storemd.ErrNotFound` from `Get` and `Delete` when the key doesn't exist (checked via `errors.Is`)
 2. Return results from `List` sorted lexicographically by key
 3. Return an empty slice (not nil) from `List` when there are no results
 4. Support `Prefix`, `StartAfter`, and `Limit` in `ListArgs` (Limit is a string, parse to int)

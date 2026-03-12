@@ -48,10 +48,13 @@ import (
 store, _ := bbolt.New("data.db")
 defer store.Close()
 ss := core.New(store)
+defer ss.Close()
 
 // Create two message stores on the same sync store
 alice := message.New(ss, "alice")
+defer alice.Close()
 bob := message.New(ss, "bob")
+defer bob.Close()
 
 // Register a handler on Bob
 bob.Handle("greet", func(msg message.Envelope) (string, error) {
@@ -114,7 +117,7 @@ type MessageListener func(msg Envelope)
 func (m *StoreMessage) Close()
 ```
 
-Unsubscribes from the sync store and cancels any pending `Send` calls.
+Unsubscribes from the sync store and cancels any pending `Send` calls. Always call `Close()` when the message store is no longer needed to prevent resource leaks.
 
 ## Cross-Store Messaging
 
@@ -126,9 +129,13 @@ store1, _ := bbolt.New("node1.db")
 store2, _ := bbolt.New("node2.db")
 ss1 := core.New(store1)
 ss2 := core.New(store2)
+defer ss1.Close()
+defer ss2.Close()
 
 a := message.New(ss1, "a")
+defer a.Close()
 b := message.New(ss2, "b")
+defer b.Close()
 
 b.Handle("ping", func(msg message.Envelope) (string, error) {
     return "pong", nil

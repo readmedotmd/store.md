@@ -16,10 +16,10 @@ Write your code against one interface. Swap the backend without changing a line.
 
 ```go
 type Store interface {
-    Get(key string) (value string, err error)
-    Set(key, value string) (err error)
-    Delete(key string) (err error)
-    List(args ListArgs) (result []KeyValuePair, err error)
+    Get(ctx context.Context, key string) (value string, err error)
+    Set(ctx context.Context, key, value string) (err error)
+    Delete(ctx context.Context, key string) (err error)
+    List(ctx context.Context, args ListArgs) (result []KeyValuePair, err error)
 }
 ```
 
@@ -80,6 +80,8 @@ go get github.com/readmedotmd/store.md/backend/bbolt
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
 
     storemd "github.com/readmedotmd/store.md"
@@ -90,10 +92,12 @@ func main() {
     store, _ := bbolt.New("data.db")
     defer store.Close()
 
-    store.Set("hello", "world")
+    ctx := context.Background()
 
-    val, err := store.Get("hello")
-    if err == storemd.NotFoundError {
+    store.Set(ctx, "hello", "world")
+
+    val, err := store.Get(ctx, "hello")
+    if errors.Is(err, storemd.ErrNotFound) {
         fmt.Println("not found")
         return
     }
@@ -110,19 +114,25 @@ func main() {
 Built-in peer-to-peer synchronization with **last-write-wins conflict resolution**.
 
 ```go
-import "github.com/readmedotmd/store.md/sync/core"
+import (
+    "context"
 
+    "github.com/readmedotmd/store.md/sync/core"
+)
+
+ctx := context.Background()
 ss := core.New(store)
+defer ss.Close()
 
 // Write data
-ss.SetItem("myapp", "config", `{"theme":"dark"}`)
+ss.SetItem(ctx, "myapp", "config", `{"theme":"dark"}`)
 
 // Sync with a peer
-outgoing, _ := ss.Sync("peer-2", nil)        // initiate
-response, _ := peer.Sync("peer-1", outgoing) // peer processes and responds
+outgoing, _ := ss.Sync(ctx, "peer-2", nil)        // initiate
+response, _ := peer.Sync(ctx, "peer-1", outgoing) // peer processes and responds
 ```
 
-The unified `Sync` method handles both sending and receiving. The `core.StoreSync` implementation uses queue-based incremental sync with timestamp conflict resolution. It implements the `SyncStore` interface and works with the server and client packages.
+The unified `Sync` method handles both sending and receiving. The `core.StoreSync` implementation uses queue-based incremental sync with timestamp conflict resolution. It implements the `SyncStore` interface and works with the server and client packages. Call `Close()` on sync stores when done to release resources cleanly.
 
 > [Sync documentation &rarr;](./docs/sync.md)
 
@@ -141,6 +151,7 @@ import (
 
 store, _ := bbolt.New("data.db")
 ss := core.New(store)
+defer ss.Close()
 
 srv := server.New(ss, server.TokenAuth(map[string]string{
     "secret-token-1": "peer-1",
@@ -225,6 +236,7 @@ import (
 
 store, _ := bbolt.New("local.db")
 ss := core.New(store)
+defer ss.Close()
 
 c := client.New(ss, client.WithInterval(5*time.Second))
 defer c.Close()
@@ -243,7 +255,7 @@ The adapter supports multiple simultaneous connections, broadcasts updates betwe
 
 ## Testing
 
-Every backend passes the same **14-test generic suite**. Use it for your own implementations:
+Every backend passes the same generic test suite, including concurrent access tests. Use it for your own implementations:
 
 ```go
 func TestMyStore(t *testing.T) {

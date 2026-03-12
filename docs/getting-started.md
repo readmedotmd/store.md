@@ -24,10 +24,10 @@ Every backend implements the same interface:
 
 ```go
 type Store interface {
-    Get(key string) (value string, err error)
-    Set(key, value string) (err error)
-    Delete(key string) (err error)
-    List(args ListArgs) (result []KeyValuePair, err error)
+    Get(ctx context.Context, key string) (value string, err error)
+    Set(ctx context.Context, key, value string) (err error)
+    Delete(ctx context.Context, key string) (err error)
+    List(ctx context.Context, args ListArgs) (result []KeyValuePair, err error)
 }
 ```
 
@@ -43,11 +43,11 @@ type ListArgs struct {
 
 ## Error Handling
 
-When a key doesn't exist, `Get` and `Delete` return `storemd.NotFoundError`:
+When a key doesn't exist, `Get` and `Delete` return `storemd.ErrNotFound`. Use `errors.Is` for comparison:
 
 ```go
-val, err := store.Get("missing-key")
-if err == storemd.NotFoundError {
+val, err := store.Get(ctx, "missing-key")
+if errors.Is(err, storemd.ErrNotFound) {
     // key does not exist
 }
 ```
@@ -58,6 +58,8 @@ if err == storemd.NotFoundError {
 package main
 
 import (
+    "context"
+    "errors"
     "fmt"
     "log"
 
@@ -72,20 +74,22 @@ func main() {
     }
     defer store.Close()
 
+    ctx := context.Background()
+
     // Set a value
-    store.Set("user:1:name", "Alice")
-    store.Set("user:2:name", "Bob")
+    store.Set(ctx, "user:1:name", "Alice")
+    store.Set(ctx, "user:2:name", "Bob")
 
     // Get a value
-    name, err := store.Get("user:1:name")
-    if err == storemd.NotFoundError {
+    name, err := store.Get(ctx, "user:1:name")
+    if errors.Is(err, storemd.ErrNotFound) {
         fmt.Println("not found")
         return
     }
     fmt.Println(name) // Alice
 
     // List with prefix
-    users, _ := store.List(storemd.ListArgs{
+    users, _ := store.List(ctx, storemd.ListArgs{
         Prefix: "user:",
     })
     for _, u := range users {
@@ -93,10 +97,10 @@ func main() {
     }
 
     // Paginate
-    page1, _ := store.List(storemd.ListArgs{Limit: "10"})
+    page1, _ := store.List(ctx, storemd.ListArgs{Limit: "10"})
     if len(page1) == 10 {
         lastKey := page1[len(page1)-1].Key
-        page2, _ := store.List(storemd.ListArgs{
+        page2, _ := store.List(ctx, storemd.ListArgs{
             Limit:      "10",
             StartAfter: lastKey,
         })
@@ -104,7 +108,7 @@ func main() {
     }
 
     // Delete
-    store.Delete("user:1:name")
+    store.Delete(ctx, "user:1:name")
 }
 ```
 
@@ -128,7 +132,7 @@ func TestMyStore(t *testing.T) {
 }
 ```
 
-This runs 14 tests covering all interface methods, edge cases, ordering, and pagination.
+This runs the full test suite covering all interface methods, edge cases, ordering, pagination, and concurrent access.
 
 ## Next Steps
 

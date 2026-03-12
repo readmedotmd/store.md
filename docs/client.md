@@ -25,6 +25,7 @@ Two implementations are provided:
 ```go
 import (
     "net/http"
+    "time"
 
     "github.com/readmedotmd/store.md/backend/bbolt"
     "github.com/readmedotmd/store.md/sync/client"
@@ -34,6 +35,7 @@ import (
 store, _ := bbolt.New("local.db")
 defer store.Close()
 ss := core.New(store)
+defer ss.Close()
 
 c := client.New(ss, client.WithInterval(5*time.Second))
 defer c.Close()
@@ -111,6 +113,18 @@ On local update (`OnUpdate`), the adapter initiates sync on all active connectio
 // Set the sync interval (default: 5 seconds)
 client.WithInterval(10 * time.Second)
 ```
+
+### Structured Logging
+
+The client adapter supports structured logging via `slog`. Pass a logger to capture connection events, sync errors, and protocol messages:
+
+```go
+c := client.New(ss, client.WithLogger(slog.Default()))
+```
+
+### Connection Limits
+
+The sync server enforces connection limits. If the limit is reached, new connections are rejected. Clients should handle connection errors and implement backoff/retry logic.
 
 ## How the Server Uses It
 

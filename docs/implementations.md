@@ -1,6 +1,6 @@
 # Implementations
 
-All implementations satisfy the `storemd.Store` interface and pass the generic test suite.
+All implementations satisfy the `storemd.Store` interface and pass the generic test suite. All Store methods accept a `context.Context` as the first parameter, enabling cancellation and timeout propagation.
 
 ---
 
@@ -88,6 +88,8 @@ Values are stored as object contents. `List` uses `ListObjects` and fetches each
 
 **Note:** `Delete` performs a `StatObject` check first since S3's `RemoveObject` doesn't error on missing keys.
 
+**Context:** S3 operations respect context deadlines and cancellation. The default timeout is 30 seconds when no deadline is set on the context.
+
 ---
 
 ## MongoDB — `backend/mongodb/`
@@ -111,6 +113,8 @@ Documents are stored as `{_id: key, value: value}`. List uses regex for prefix f
 
 **Best for:** Document-oriented projects, existing MongoDB infrastructure.
 
+**Context:** MongoDB operations respect context deadlines and cancellation. The default timeout is 30 seconds when no deadline is set on the context.
+
 ---
 
 ## Redis — `backend/redis/`
@@ -133,6 +137,8 @@ store := redisstore.New(client, "myapp:") // key prefix for namespacing
 **Best for:** Caching layers, shared state across services, pub/sub systems.
 
 **Note:** Key prefix is recommended to avoid collisions in shared Redis instances.
+
+**Context:** Redis operations respect context deadlines and cancellation. The default timeout is 30 seconds when no deadline is set on the context.
 
 ---
 
