@@ -217,3 +217,128 @@ func TestClient_Close(t *testing.T) {
 		t.Fatalf("double Close: %v", err)
 	}
 }
+
+func startHTTPServer(t *testing.T, ss storesync.SyncStore) *httptest.Server {
+	t.Helper()
+	tokens := map[string]string{
+		"test-token": "test-peer",
+		"token-a":    "peer-a",
+		"token-b":    "peer-b",
+	}
+	srv := server.New(ss, server.TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	srv.EnableHTTP()
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestClient_HTTPDialer_PullFromServer(t *testing.T) {
+	ctx := context.Background()
+	serverStore := newSyncStore(t)
+
+	if err := serverStore.SetItem(ctx, "app", "key1", "val1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverStore.SetItem(ctx, "app", "key2", "val2"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := startHTTPServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.WithDialer(client.HTTPDialer(100*time.Millisecond)))
+	defer c.Close()
+
+	if err := c.Connect("client-peer", ts.URL, authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	v1, err := clientStore.Get(ctx, "key1")
+	if err != nil {
+		t.Fatalf("Get key1: %v", err)
+	}
+	if v1 != "val1" {
+		t.Fatalf("expected val1, got %q", v1)
+	}
+
+	v2, err := clientStore.Get(ctx, "key2")
+	if err != nil {
+		t.Fatalf("Get key2: %v", err)
+	}
+	if v2 != "val2" {
+		t.Fatalf("expected val2, got %q", v2)
+	}
+}
+
+func TestClient_HTTPDialer_PushToServer(t *testing.T) {
+	ctx := context.Background()
+	serverStore := newSyncStore(t)
+	ts := startHTTPServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.WithDialer(client.HTTPDialer(100*time.Millisecond)))
+	defer c.Close()
+
+	if err := c.Connect("client-peer", ts.URL, authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync exchange to complete before writing.
+	time.Sleep(300 * time.Millisecond)
+
+	if err := clientStore.SetItem(ctx, "app", "pushed-key", "pushed-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	item, err := serverStore.GetItem(ctx, "pushed-key")
+	if err != nil {
+		t.Fatalf("GetItem: %v", err)
+	}
+	if item.Value != "pushed-val" {
+		t.Fatalf("expected pushed-val, got %q", item.Value)
+	}
+}
+
+func TestClient_CustomDialer(t *testing.T) {
+	ctx := context.Background()
+	serverStore := newSyncStore(t)
+
+	if err := serverStore.SetItem(ctx, "app", "custom-key", "custom-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := startHTTPServer(t, serverStore)
+
+	dialerCalled := false
+	customDialer := func(peerID, url string, header http.Header) (client.Connection, error) {
+		dialerCalled = true
+		return client.HTTPDialer(100 * time.Millisecond)(peerID, url, header)
+	}
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.WithDialer(customDialer))
+	defer c.Close()
+
+	if err := c.Connect("client-peer", ts.URL, authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !dialerCalled {
+		t.Fatal("custom dialer was not called")
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	v, err := clientStore.Get(ctx, "custom-key")
+	if err != nil {
+		t.Fatalf("Get custom-key: %v", err)
+	}
+	if v != "custom-val" {
+		t.Fatalf("expected custom-val, got %q", v)
+	}
+}

@@ -1,7 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,10 +78,11 @@ func TestSyncExchange(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	if err := ss.SetItem("app", "key1", "val1"); err != nil {
+	ctx := context.Background()
+	if err := ss.SetItem(ctx, "app", "key1", "val1"); err != nil {
 		t.Fatalf("Set failed: %v", err)
 	}
-	if err := ss.SetItem("app", "key2", "val2"); err != nil {
+	if err := ss.SetItem(ctx, "app", "key2", "val2"); err != nil {
 		t.Fatalf("Set failed: %v", err)
 	}
 
@@ -143,7 +149,7 @@ func TestSyncPushItems(t *testing.T) {
 	// Give it a moment to process
 	time.Sleep(100 * time.Millisecond)
 
-	item, err := ss.GetItem("pushed-key")
+	item, err := ss.GetItem(context.Background(), "pushed-key")
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
 	}
@@ -180,7 +186,7 @@ func TestSyncRoundTrip(t *testing.T) {
 	// Wait for server to process
 	time.Sleep(200 * time.Millisecond)
 
-	item, err := ss.GetItem("shared-key")
+	item, err := ss.GetItem(context.Background(), "shared-key")
 	if err != nil {
 		t.Fatalf("Get shared-key failed: %v", err)
 	}
@@ -259,10 +265,11 @@ func TestMulti_IsolatedStores(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	if err := stores["room-a"].SetItem("app", "key1", "room-a-val"); err != nil {
+	ctx := context.Background()
+	if err := stores["room-a"].SetItem(ctx, "app", "key1", "room-a-val"); err != nil {
 		t.Fatalf("SetItem failed: %v", err)
 	}
-	if err := stores["room-b"].SetItem("app", "key1", "room-b-val"); err != nil {
+	if err := stores["room-b"].SetItem(ctx, "app", "key1", "room-b-val"); err != nil {
 		t.Fatalf("SetItem failed: %v", err)
 	}
 
@@ -329,7 +336,7 @@ func TestMulti_PushToSpecificStore(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	item, err := stores["room-a"].GetItem("pushed")
+	item, err := stores["room-a"].GetItem(context.Background(), "pushed")
 	if err != nil {
 		t.Fatalf("GetItem failed: %v", err)
 	}
@@ -337,7 +344,7 @@ func TestMulti_PushToSpecificStore(t *testing.T) {
 		t.Fatalf("expected %q, got %q", "to-room-a", item.Value)
 	}
 
-	_, err = stores["room-b"].GetItem("pushed")
+	_, err = stores["room-b"].GetItem(context.Background(), "pushed")
 	if err == nil {
 		t.Fatal("expected error for missing key in room-b, got nil")
 	}
@@ -436,7 +443,7 @@ func TestUnknownMessageType(t *testing.T) {
 	defer ts.Close()
 
 	// Add data so the server has something to respond with.
-	ss.SetItem("app", "key1", "val1")
+	ss.SetItem(context.Background(), "app", "key1", "val1")
 
 	conn := dialWS(t, wsURL(ts), "token-peer1")
 
@@ -456,5 +463,231 @@ func TestUnknownMessageType(t *testing.T) {
 	}
 	if resp.Type != "sync" {
 		t.Fatalf("expected sync, got %q", resp.Type)
+	}
+}
+
+// --- HTTP transport tests ---
+
+func newHTTPTestServer(t *testing.T) (*Server, *storesync.StoreSync) {
+	t.Helper()
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{
+		"token-peer1": "peer1",
+		"token-peer2": "peer2",
+	}
+	srv := New(ss, TokenAuth(tokens))
+	srv.EnableHTTP()
+	return srv, ss
+}
+
+func httpPost(t *testing.T, url, token string, msg client.Message) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP POST failed: %v", err)
+	}
+	return resp
+}
+
+func TestHTTP_SyncExchange(t *testing.T) {
+	srv, ss := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if err := ss.SetItem(ctx, "app", "key1", "val1"); err != nil {
+		t.Fatalf("SetItem failed: %v", err)
+	}
+	if err := ss.SetItem(ctx, "app", "key2", "val2"); err != nil {
+		t.Fatalf("SetItem failed: %v", err)
+	}
+
+	msg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	resp := httpPost(t, ts.URL, "token-peer1", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var respMsg client.Message
+	if err := json.NewDecoder(resp.Body).Decode(&respMsg); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if respMsg.Type != "sync" {
+		t.Fatalf("expected sync, got %q", respMsg.Type)
+	}
+	if respMsg.Payload == nil {
+		t.Fatal("expected non-nil payload")
+	}
+	if len(respMsg.Payload.Items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(respMsg.Payload.Items))
+	}
+}
+
+func TestHTTP_PushItems(t *testing.T) {
+	srv, ss := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	payload := storesync.SyncPayload{
+		Items: []storesync.SyncStoreItem{
+			{
+				App:       "app",
+				Key:       "http-pushed",
+				Value:     "http-val",
+				Timestamp: time.Now().UnixNano(),
+				ID:        "http-push-1",
+			},
+		},
+	}
+
+	msg := client.Message{Type: "sync", Payload: &payload}
+	resp := httpPost(t, ts.URL, "token-peer1", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	// Verify item landed in the server store.
+	time.Sleep(100 * time.Millisecond)
+
+	item, err := ss.GetItem(context.Background(), "http-pushed")
+	if err != nil {
+		t.Fatalf("GetItem failed: %v", err)
+	}
+	if item.Value != "http-val" {
+		t.Fatalf("expected %q, got %q", "http-val", item.Value)
+	}
+}
+
+func TestHTTP_InvalidMethod(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{
+		"token-peer1": "peer1",
+		"token-peer2": "peer2",
+	}
+	// Create a server with only HTTP transport (no WebSocket).
+	srv := &Server{
+		store:         ss,
+		auth:          TokenAuth(tokens),
+		logger:        slog.Default(),
+		transports:    []Transport{&HTTPTransport{}},
+		maxConnsPerPeer: 10,
+		maxTotalConns:   1000,
+		peerConns:      make(map[string]int),
+		authFailCount:  make(map[string]*authFailEntry),
+		adapters:       make(map[storesync.SyncStore]*client.Client),
+	}
+	srv.adapters[ss] = client.New(ss)
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer token-peer1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestHTTP_InvalidMessageType(t *testing.T) {
+	srv, _ := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	msg := client.Message{Type: "bogus"}
+	resp := httpPost(t, ts.URL, "token-peer1", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestHTTP_AuthRequired(t *testing.T) {
+	srv, _ := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	msg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	resp := httpPost(t, ts.URL, "", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 401, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestHTTP_WebSocketAndHTTPCoexist(t *testing.T) {
+	srv, ss := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if err := ss.SetItem(ctx, "app", "coexist-key", "coexist-val"); err != nil {
+		t.Fatalf("SetItem failed: %v", err)
+	}
+
+	// Verify WebSocket still works.
+	conn := dialWS(t, wsURL(ts), "token-peer1")
+	wsReq := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	if err := conn.WriteJSON(wsReq); err != nil {
+		t.Fatalf("WriteJSON failed: %v", err)
+	}
+	var wsResp client.Message
+	if err := conn.ReadJSON(&wsResp); err != nil {
+		t.Fatalf("ReadJSON failed: %v", err)
+	}
+	if wsResp.Type != "sync" {
+		t.Fatalf("expected sync from WS, got %q", wsResp.Type)
+	}
+	if wsResp.Payload == nil || len(wsResp.Payload.Items) < 1 {
+		t.Fatal("expected at least 1 item from WS sync")
+	}
+
+	// Verify HTTP POST also works on the same server.
+	httpMsg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	resp := httpPost(t, ts.URL, "token-peer2", httpMsg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var httpResp client.Message
+	if err := json.NewDecoder(resp.Body).Decode(&httpResp); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if httpResp.Type != "sync" {
+		t.Fatalf("expected sync from HTTP, got %q", httpResp.Type)
+	}
+	if httpResp.Payload == nil || len(httpResp.Payload.Items) < 1 {
+		t.Fatal("expected at least 1 item from HTTP sync")
 	}
 }

@@ -46,6 +46,7 @@ type managedConn struct {
 type Client struct {
 	store  storesync.SyncStore
 	logger *slog.Logger
+	dialer Dialer
 
 	maxConns int
 
@@ -86,6 +87,7 @@ func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
 		store:    store,
 		logger:   slog.Default(),
+		dialer:   Dial,
 		maxConns: 100,
 		done:     make(chan struct{}),
 		notifyCh: make(chan struct{}, 1),
@@ -139,10 +141,12 @@ func (c *Client) notifyLoop() {
 	}
 }
 
-// Connect dials a remote WebSocket server and starts actively syncing.
-// Can be called multiple times to connect to multiple servers.
+// Connect dials a remote server using the configured Dialer and starts
+// actively syncing. The default dialer uses WebSocket; use WithDialer to
+// switch to HTTP or a custom transport. Can be called multiple times to
+// connect to multiple servers.
 func (c *Client) Connect(peerID, url string, header http.Header) error {
-	conn, err := Dial(peerID, url, header)
+	conn, err := c.dialer(peerID, url, header)
 	if err != nil {
 		return err
 	}

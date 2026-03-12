@@ -14,6 +14,8 @@ import (
 	storesync "github.com/readmedotmd/store.md/sync/core"
 )
 
+var _ http.Handler = (*Server)(nil)
+
 // Authorizer extracts a peer ID from a request, returning an error if unauthorized.
 type Authorizer func(r *http.Request) (peerID string, err error)
 
@@ -27,14 +29,18 @@ type TokenInfo struct {
 	ExpiresAt time.Time // zero means never expires
 }
 
-// Server is a WebSocket sync server that accepts incoming connections and
-// delegates sync protocol handling to the client adapter.
+// Server is a sync server that accepts incoming connections and delegates
+// sync protocol handling to pluggable transports. By default, it uses
+// WebSocket. Call EnableHTTP to also accept HTTP POST requests, or use
+// AddTransport to register custom transports.
 type Server struct {
 	store    storesync.SyncStore // single-store mode (nil when using resolver)
 	resolver StoreResolver       // multi-store mode (nil when using single store)
 	auth     Authorizer
-	upgrader websocket.Upgrader
 	logger   *slog.Logger
+
+	transports  []Transport
+	wsTransport *WebSocketTransport // kept for SetAllowedOrigins
 
 	maxConnsPerPeer int
 	maxTotalConns   int
@@ -58,12 +64,15 @@ type authFailEntry struct {
 }
 
 // New creates a single-store server. All connections share the same StoreSync.
+// WebSocket transport is enabled by default.
 func New(store storesync.SyncStore, auth Authorizer) *Server {
+	wst := &WebSocketTransport{Upgrader: websocket.Upgrader{}}
 	s := &Server{
 		store:           store,
 		auth:            auth,
-		upgrader:        websocket.Upgrader{},
 		logger:          slog.Default(),
+		transports:      []Transport{wst},
+		wsTransport:     wst,
 		maxConnsPerPeer: 10,
 		maxTotalConns:   1000,
 		peerConns:       make(map[string]int),
@@ -76,12 +85,15 @@ func New(store storesync.SyncStore, auth Authorizer) *Server {
 
 // NewMulti creates a multi-store server. The store ID is extracted from the URL
 // path — connect to /sync/{storeID} and the resolver maps storeID to a StoreSync.
+// WebSocket transport is enabled by default.
 func NewMulti(resolver StoreResolver, auth Authorizer) *Server {
+	wst := &WebSocketTransport{Upgrader: websocket.Upgrader{}}
 	return &Server{
 		resolver:        resolver,
 		auth:            auth,
-		upgrader:        websocket.Upgrader{},
 		logger:          slog.Default(),
+		transports:      []Transport{wst},
+		wsTransport:     wst,
 		maxConnsPerPeer: 10,
 		maxTotalConns:   1000,
 		peerConns:       make(map[string]int),
@@ -110,7 +122,10 @@ func (s *Server) SetMaxTotalConns(n int) {
 // allows any website to connect to your sync server.
 // Example: SetAllowedOrigins([]string{"https://myapp.example.com"})
 func (s *Server) SetAllowedOrigins(origins []string) {
-	s.upgrader.CheckOrigin = func(r *http.Request) bool {
+	if s.wsTransport == nil {
+		return
+	}
+	s.wsTransport.Upgrader.CheckOrigin = func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		for _, o := range origins {
 			if o == "*" || o == origin {
@@ -119,6 +134,19 @@ func (s *Server) SetAllowedOrigins(origins []string) {
 		}
 		return false
 	}
+}
+
+// AddTransport registers a transport with the server. Transports are tried
+// in registration order; the first whose CanHandle returns true is used.
+func (s *Server) AddTransport(t Transport) {
+	s.transports = append(s.transports, t)
+}
+
+// EnableHTTP adds an HTTP POST transport so the server can accept sync
+// requests over plain HTTP in addition to WebSocket. HTTP transport is
+// stateless — each POST carries one sync message and receives one response.
+func (s *Server) EnableHTTP() {
+	s.AddTransport(&HTTPTransport{})
 }
 
 // TokenAuth returns an Authorizer that validates Bearer tokens.
@@ -286,6 +314,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Find a transport that can handle this request.
+	var transport Transport
+	for _, t := range s.transports {
+		if t.CanHandle(r) {
+			transport = t
+			break
+		}
+	}
+	if transport == nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
 	// Check connection limits.
 	if err := s.acquireConn(peerID); err != nil {
 		s.logger.Warn("connection limit reached", "peer", peerID, "err", err)
@@ -293,29 +334,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ws, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		s.releaseConn(peerID)
-		return
-	}
-
-	conn := &notifyConn{
-		Connection: client.NewConn(ws, peerID),
-		done:       make(chan struct{}),
-	}
-
 	adapter := s.getAdapter(store)
-	if err := adapter.AddConnection(conn); err != nil {
-		s.logger.Error("AddConnection error", "err", err)
-		ws.Close()
-		s.releaseConn(peerID)
-		return
+	if err := transport.Serve(w, r, peerID, store, adapter, s.logger); err != nil {
+		s.logger.Error("transport error", "err", err)
 	}
-
-	// Block until the connection is closed. The adapter's readLoop handles
-	// all protocol messages. The notifyConn signals done when ReadMessage
-	// returns an error (i.e. the connection dropped).
-	<-conn.done
 	s.releaseConn(peerID)
 }
 
@@ -366,5 +388,3 @@ func (s *Server) CloseWithContext(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-
-var _ http.Handler = (*Server)(nil)

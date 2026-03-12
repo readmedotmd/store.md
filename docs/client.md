@@ -15,10 +15,11 @@ type Connection interface {
 }
 ```
 
-Two implementations are provided:
+Three implementations are provided:
 
-- **`Dial`** — creates a client-side connection by dialing a WebSocket server
+- **`Dial`** — creates a client-side WebSocket connection (default)
 - **`NewConn`** — wraps an already-upgraded `*websocket.Conn` (used by the server package)
+- **`HTTPDialer`** — creates an HTTP POST-based connection for environments without WebSocket
 
 ## Quick Start
 
@@ -44,6 +45,42 @@ header.Set("Authorization", "Bearer my-token")
 
 // Connect to a remote sync server
 err := c.Connect("my-peer-id", "ws://localhost:8080", header)
+```
+
+## Pluggable Dialers
+
+The client uses a `Dialer` to create outbound connections. By default it uses WebSocket, but you can switch to HTTP or provide a custom dialer:
+
+```go
+// Dialer type
+type Dialer func(peerID, url string, header http.Header) (Connection, error)
+```
+
+### HTTP Dialer
+
+Use `HTTPDialer` to sync over HTTP POST when WebSocket is not available. The server must have HTTP transport enabled (`srv.EnableHTTP()`).
+
+```go
+c := client.New(ss, client.WithDialer(client.HTTPDialer()))
+err := c.Connect("peer-id", "http://server:8080/sync", header)
+```
+
+HTTP connections poll the server at a configurable interval (default 5s) to discover server-pushed changes:
+
+```go
+// Poll every 2 seconds
+c := client.New(ss, client.WithDialer(client.HTTPDialer(2 * time.Second)))
+```
+
+### Custom Dialer
+
+Implement the `Dialer` function signature to use any transport:
+
+```go
+myDialer := func(peerID, url string, header http.Header) (client.Connection, error) {
+    // Create and return a Connection implementation
+}
+c := client.New(ss, client.WithDialer(myDialer))
 ```
 
 ## Active vs Passive Connections

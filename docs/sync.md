@@ -216,6 +216,55 @@ Incoming items with timestamps more than 5 minutes in the future are rejected. T
 
 ---
 
+## Pluggable Transports
+
+The sync server supports pluggable transports for handling different network protocols. WebSocket is enabled by default; HTTP POST can be added for environments where WebSocket is not available.
+
+### Transport Interface
+
+```go
+type Transport interface {
+    CanHandle(r *http.Request) bool
+    Serve(w http.ResponseWriter, r *http.Request, peerID string, store storesync.SyncStore, adapter *client.Client, logger *slog.Logger) error
+}
+```
+
+Two built-in transports are provided:
+
+| Transport | Protocol | Behavior |
+|-----------|----------|----------|
+| `WebSocketTransport` | WebSocket | Persistent bidirectional connection. Blocks until the connection closes. |
+| `HTTPTransport` | HTTP POST | Stateless request-response. Each POST carries one sync message and receives one response. |
+
+### Enabling HTTP Transport
+
+```go
+srv := server.New(store, auth)
+srv.EnableHTTP() // accept both WebSocket and HTTP POST
+```
+
+Clients send sync messages as HTTP POST requests with a JSON body:
+
+```
+POST /sync HTTP/1.1
+Authorization: Bearer my-token
+Content-Type: application/json
+
+{"type":"sync","payload":{"items":[...]}}
+```
+
+### Custom Transports
+
+Implement the `Transport` interface and register it with `AddTransport`:
+
+```go
+srv.AddTransport(myCustomTransport)
+```
+
+Transports are tried in registration order; the first whose `CanHandle` returns true is used.
+
+---
+
 ## Security
 
 ### Use TLS in Production
