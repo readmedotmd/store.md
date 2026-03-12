@@ -1,8 +1,11 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	gosync "sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +13,12 @@ import (
 	"github.com/google/uuid"
 	storemd "github.com/readmedotmd/store.md"
 )
+
+// MaxSyncInItems is the maximum number of items allowed in a single SyncIn payload.
+const MaxSyncInItems = 5000
+
+// MaxClockSkew is the maximum allowed clock skew for item timestamps.
+const MaxClockSkew = 5 * time.Minute
 
 // UpdateListener is a callback invoked when an item is successfully written.
 type UpdateListener func(item SyncStoreItem)
@@ -24,6 +33,24 @@ type SyncStoreItem struct {
 	Deleted        bool   `json:"deleted,omitempty"`
 }
 
+// gcRequest is a request to garbage-collect old values for a key.
+type gcRequest struct {
+	key, currentID string
+}
+
+// Option configures a StoreSync.
+type Option func(*StoreSync)
+
+// WithTimeOffset sets the write-time offset in nanoseconds.
+func WithTimeOffset(offset int64) Option {
+	return func(s *StoreSync) { s.timeOffset = offset }
+}
+
+// WithLogger sets the structured logger.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *StoreSync) { s.logger = l }
+}
+
 type StoreSync struct {
 	store        storemd.Store
 	timeOffset   int64 // nanoseconds
@@ -31,6 +58,12 @@ type StoreSync struct {
 	mu           gosync.RWMutex
 	listeners    map[uint64]UpdateListener
 	nextListenID atomic.Uint64
+	logger       *slog.Logger
+
+	// Bounded GC worker pool
+	gcCh chan gcRequest
+	done chan struct{}
+	wg   gosync.WaitGroup
 }
 
 func New(store storemd.Store, timeOffset ...int64) *StoreSync {
@@ -38,11 +71,72 @@ func New(store storemd.Store, timeOffset ...int64) *StoreSync {
 	if len(timeOffset) > 0 {
 		offset = timeOffset[0]
 	}
-	return &StoreSync{
+	s := &StoreSync{
 		store:      store,
 		timeOffset: offset,
 		listeners:  make(map[uint64]UpdateListener),
+		logger:     slog.Default(),
+		gcCh:       make(chan gcRequest, 256),
+		done:       make(chan struct{}),
 	}
+	s.startGCWorkers(4)
+	return s
+}
+
+// NewWithOptions creates a StoreSync with functional options.
+func NewWithOptions(store storemd.Store, opts ...Option) *StoreSync {
+	s := &StoreSync{
+		store:      store,
+		timeOffset: 10_000_000_000, // 10 seconds default
+		listeners:  make(map[uint64]UpdateListener),
+		logger:     slog.Default(),
+		gcCh:       make(chan gcRequest, 256),
+		done:       make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	s.startGCWorkers(4)
+	return s
+}
+
+func (s *StoreSync) startGCWorkers(n int) {
+	for i := range n {
+		s.wg.Add(1)
+		go func(id int) {
+			defer s.wg.Done()
+			s.logger.Debug("gc worker started", "worker", id)
+			for {
+				select {
+				case <-s.done:
+					s.logger.Debug("gc worker stopping", "worker", id)
+					return
+				case req, ok := <-s.gcCh:
+					if !ok {
+						return
+					}
+					s.gcKey(req.key, req.currentID)
+				}
+			}
+		}(i)
+	}
+}
+
+// Close stops GC workers and waits for them to finish.
+func (s *StoreSync) Close() error {
+	close(s.done)
+	// Drain remaining GC requests so workers can exit.
+	for {
+		select {
+		case <-s.gcCh:
+		default:
+			goto drained
+		}
+	}
+drained:
+	s.wg.Wait()
+	s.logger.Debug("store sync closed")
+	return nil
 }
 
 // OnUpdate registers a listener that is called whenever an item is written
@@ -92,32 +186,32 @@ func LastSyncOutKey(peerID string) string {
 }
 
 // Get implements storemd.Store. Returns the value string for the given key.
-// Returns NotFoundError if the key has been deleted (tombstoned).
-func (s *StoreSync) Get(key string) (string, error) {
-	item, err := s.getItem(key)
+// Returns ErrNotFound if the key has been deleted (tombstoned).
+func (s *StoreSync) Get(ctx context.Context, key string) (string, error) {
+	item, err := s.getItem(ctx, key)
 	if err != nil {
 		return "", err
 	}
 	if item.Deleted {
-		return "", storemd.NotFoundError
+		return "", storemd.ErrNotFound
 	}
 	return item.Value, nil
 }
 
 // Set implements storemd.Store. Writes a value with an empty app.
-func (s *StoreSync) Set(key, value string) error {
-	return s.SetItem("", key, value)
+func (s *StoreSync) Set(ctx context.Context, key, value string) error {
+	return s.SetItem(ctx, "", key, value)
 }
 
 // Delete implements storemd.Store. Writes a tombstone that syncs to all peers.
-// Returns NotFoundError if the key does not exist.
-func (s *StoreSync) Delete(key string) error {
-	existing, err := s.getItem(key)
+// Returns ErrNotFound if the key does not exist.
+func (s *StoreSync) Delete(ctx context.Context, key string) error {
+	existing, err := s.getItem(ctx, key)
 	if err != nil {
 		return err
 	}
 	if existing.Deleted {
-		return storemd.NotFoundError
+		return storemd.ErrNotFound
 	}
 	item := SyncStoreItem{
 		App:       existing.App,
@@ -131,7 +225,7 @@ func (s *StoreSync) Delete(key string) error {
 }
 
 // List implements storemd.Store. Lists keys through the sync view layer.
-func (s *StoreSync) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
+func (s *StoreSync) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	viewArgs := storemd.ListArgs{
 		Prefix: ViewKey(args.Prefix),
 		Limit:  args.Limit,
@@ -140,16 +234,16 @@ func (s *StoreSync) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) 
 		viewArgs.StartAfter = ViewKey(args.StartAfter)
 	}
 
-	list, err := s.store.List(viewArgs)
+	list, err := s.store.List(ctx, viewArgs)
 	if err != nil {
 		return nil, err
 	}
 
 	result := make([]storemd.KeyValuePair, 0, len(list))
 	for _, kv := range list {
-		item, err := s.getValue(kv.Value)
+		item, err := s.getValue(ctx, kv.Value)
 		if err != nil {
-			if err == storemd.NotFoundError {
+			if errors.Is(err, storemd.ErrNotFound) {
 				continue
 			}
 			return nil, err
@@ -163,29 +257,29 @@ func (s *StoreSync) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) 
 }
 
 // GetItem returns the full SyncStoreItem for the given key.
-// Returns NotFoundError if the key has been deleted (tombstoned).
-func (s *StoreSync) GetItem(key string) (*SyncStoreItem, error) {
-	item, err := s.getItem(key)
+// Returns ErrNotFound if the key has been deleted (tombstoned).
+func (s *StoreSync) GetItem(ctx context.Context, key string) (*SyncStoreItem, error) {
+	item, err := s.getItem(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	if item.Deleted {
-		return nil, storemd.NotFoundError
+		return nil, storemd.ErrNotFound
 	}
 	return item, nil
 }
 
 // getItem returns the raw SyncStoreItem including tombstones.
-func (s *StoreSync) getItem(key string) (*SyncStoreItem, error) {
-	valueID, err := s.store.Get(ViewKey(key))
+func (s *StoreSync) getItem(ctx context.Context, key string) (*SyncStoreItem, error) {
+	valueID, err := s.store.Get(ctx, ViewKey(key))
 	if err != nil {
 		return nil, err
 	}
-	return s.getValue(valueID)
+	return s.getValue(ctx, valueID)
 }
 
-func (s *StoreSync) getValue(id string) (*SyncStoreItem, error) {
-	raw, err := s.store.Get(ValueKey(id))
+func (s *StoreSync) getValue(ctx context.Context, id string) (*SyncStoreItem, error) {
+	raw, err := s.store.Get(ctx, ValueKey(id))
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +291,7 @@ func (s *StoreSync) getValue(id string) (*SyncStoreItem, error) {
 }
 
 // ListItems returns SyncStoreItems matching the given prefix, pagination, and limit.
-func (s *StoreSync) ListItems(prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
+func (s *StoreSync) ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
 	args := storemd.ListArgs{
 		Prefix: ViewKey(prefix),
 		Limit:  limit,
@@ -206,16 +300,16 @@ func (s *StoreSync) ListItems(prefix, startAfter string, limit int) ([]SyncStore
 		args.StartAfter = ViewKey(startAfter)
 	}
 
-	list, err := s.store.List(args)
+	list, err := s.store.List(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 
 	items := make([]SyncStoreItem, 0, len(list))
 	for _, kv := range list {
-		item, err := s.getValue(kv.Value)
+		item, err := s.getValue(ctx, kv.Value)
 		if err != nil {
-			if err == storemd.NotFoundError {
+			if errors.Is(err, storemd.ErrNotFound) {
 				continue
 			}
 			return nil, err
@@ -230,7 +324,7 @@ func (s *StoreSync) ListItems(prefix, startAfter string, limit int) ([]SyncStore
 }
 
 // SetItem writes a value through the sync layer with app, key, and value.
-func (s *StoreSync) SetItem(app, key, value string) error {
+func (s *StoreSync) SetItem(ctx context.Context, app, key, value string) error {
 	item := SyncStoreItem{
 		App:       app,
 		Key:       key,
@@ -242,19 +336,34 @@ func (s *StoreSync) SetItem(app, key, value string) error {
 }
 
 func (s *StoreSync) setItem(item SyncStoreItem) error {
-	s.writeMu.Lock()
-
-	writeTime := time.Now().UnixNano() + s.timeOffset
-
-	// Check if existing item is newer (use getItem to see tombstones too)
-	existing, err := s.getItem(item.Key)
-	if err != nil && err != storemd.NotFoundError {
-		s.writeMu.Unlock()
+	current, err := s.setItemLocked(item)
+	if err != nil || current == nil {
 		return err
 	}
+	s.notifyListeners(*current)
+	return nil
+}
+
+func (s *StoreSync) setItemLocked(item SyncStoreItem) (*SyncStoreItem, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	ctx := context.Background()
+	writeTime := time.Now().UnixNano() + s.timeOffset
+
+	// Reject items with timestamps too far in the future (clock skew protection).
+	maxTimestamp := time.Now().UnixNano() + int64(MaxClockSkew)
+	if item.Timestamp > maxTimestamp {
+		return nil, fmt.Errorf("item timestamp too far in the future (clock skew exceeds %v)", MaxClockSkew)
+	}
+
+	// Check if existing item is newer (use getItem to see tombstones too)
+	existing, err := s.getItem(ctx, item.Key)
+	if err != nil && !errors.Is(err, storemd.ErrNotFound) {
+		return nil, err
+	}
 	if existing != nil && (existing.Timestamp > item.Timestamp || existing.ID == item.ID) {
-		s.writeMu.Unlock()
-		return nil
+		return nil, nil
 	}
 
 	item.WriteTimestamp = writeTime
@@ -262,54 +371,62 @@ func (s *StoreSync) setItem(item SyncStoreItem) error {
 
 	encoded, err := json.Marshal(item)
 	if err != nil {
-		s.writeMu.Unlock()
-		return err
+		return nil, err
 	}
 
-	if err := s.store.Set(QueueKey(queueID), item.ID); err != nil {
-		s.writeMu.Unlock()
-		return err
+	if err := s.store.Set(ctx, QueueKey(queueID), item.ID); err != nil {
+		return nil, err
 	}
-	if err := s.store.Set(ViewKey(item.Key), item.ID); err != nil {
-		s.writeMu.Unlock()
-		return err
+	if err := s.store.Set(ctx, ViewKey(item.Key), item.ID); err != nil {
+		return nil, err
 	}
-	if err := s.store.Set(ValueKey(item.ID), string(encoded)); err != nil {
-		s.writeMu.Unlock()
-		return err
+	if err := s.store.Set(ctx, ValueKey(item.ID), string(encoded)); err != nil {
+		return nil, err
 	}
 
-	// Spawn async GC to clean up all old values and queue entries for this key.
-	go s.gcKey(item.Key, item.ID)
+	// Clean up the old value inline if it's being replaced.
+	if existing != nil && existing.ID != item.ID {
+		s.store.Delete(ctx, ValueKey(existing.ID))
+	}
+
+	// Send GC request to bounded worker pool (non-blocking).
+	select {
+	case s.gcCh <- gcRequest{key: item.Key, currentID: item.ID}:
+	default:
+		// GC channel full — skip GC for this write, it will be caught later.
+	}
 
 	// Validate write time after performing writes (we want TOCTOU, else we will miss sync items)
 	if time.Now().UnixNano() > writeTime {
-		s.writeMu.Unlock()
-		return fmt.Errorf("write time is in the past")
+		return nil, fmt.Errorf("write time is in the past")
 	}
 
-	s.writeMu.Unlock()
-
-	// Notify outside the lock — listeners may call back into the store.
-	current, err := s.getItem(item.Key)
+	// Re-read the current item for notification.
+	current, err := s.getItem(ctx, item.Key)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.notifyListeners(*current)
-
-	return nil
+	return current, nil
 }
 
 // gcKey scans for all queue entries referencing the given key and removes
 // any that don't belong to the current value ID. This cleans up orphaned
 // values and queue entries that may have been missed by previous writes.
 func (s *StoreSync) gcKey(key, currentID string) {
+	ctx := context.Background()
 	// Scan all queue entries to find ones referencing this key.
 	// Queue keys are: %sync%queue%{writeTime}%{uuid}%{key}
 	suffix := "%" + key
 	var startAfter string
 	for {
-		list, err := s.store.List(storemd.ListArgs{
+		// Check if we should stop.
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		list, err := s.store.List(ctx, storemd.ListArgs{
 			Prefix:     QueueKey(""),
 			StartAfter: startAfter,
 			Limit:      100,
@@ -330,8 +447,8 @@ func (s *StoreSync) gcKey(key, currentID string) {
 			}
 			// This queue entry is for our key. Remove it if it points to an old value.
 			if kv.Value != currentID {
-				s.store.Delete(kv.Key)
-				s.store.Delete(ValueKey(kv.Value))
+				s.store.Delete(ctx, kv.Key)
+				s.store.Delete(ctx, ValueKey(kv.Value))
 			}
 		}
 		if len(list) < 100 {
@@ -346,7 +463,10 @@ type SyncPayload struct {
 }
 
 // SyncIn applies incoming items from a peer.
-func (s *StoreSync) SyncIn(peerID string, payload SyncPayload) error {
+func (s *StoreSync) SyncIn(ctx context.Context, peerID string, payload SyncPayload) error {
+	if len(payload.Items) > MaxSyncInItems {
+		return fmt.Errorf("sync payload too large: %d items (max %d)", len(payload.Items), MaxSyncInItems)
+	}
 	for _, item := range payload.Items {
 		if err := s.setItem(item); err != nil {
 			return err
@@ -358,15 +478,15 @@ func (s *StoreSync) SyncIn(peerID string, payload SyncPayload) error {
 const MaxSyncOutLimit = 1000
 
 // SyncOut returns queued items for a peer since its last sync cursor.
-func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
+func (s *StoreSync) SyncOut(ctx context.Context, peerID string, limit int) (*SyncPayload, error) {
 	if limit <= 0 || limit > MaxSyncOutLimit {
 		limit = MaxSyncOutLimit
 	}
 
 	var lastSyncTimestamp int64
 
-	raw, err := s.store.Get(LastSyncOutKey(peerID))
-	if err != nil && err != storemd.NotFoundError {
+	raw, err := s.store.Get(ctx, LastSyncOutKey(peerID))
+	if err != nil && !errors.Is(err, storemd.ErrNotFound) {
 		return nil, err
 	}
 	if err == nil {
@@ -375,7 +495,7 @@ func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
 		}
 	}
 
-	payload, err := s.syncOut(lastSyncTimestamp, limit)
+	payload, err := s.syncOut(ctx, lastSyncTimestamp, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -384,14 +504,14 @@ func (s *StoreSync) SyncOut(peerID string, limit int) (*SyncPayload, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.Set(LastSyncOutKey(peerID), string(encoded)); err != nil {
+	if err := s.store.Set(ctx, LastSyncOutKey(peerID), string(encoded)); err != nil {
 		return nil, err
 	}
 
 	return payload, nil
 }
 
-func (s *StoreSync) syncOut(timestamp int64, limit int) (*SyncPayload, error) {
+func (s *StoreSync) syncOut(ctx context.Context, timestamp int64, limit int) (*SyncPayload, error) {
 	now := time.Now().UnixNano()
 
 	args := storemd.ListArgs{
@@ -406,7 +526,7 @@ func (s *StoreSync) syncOut(timestamp int64, limit int) (*SyncPayload, error) {
 		Limit:      limit,
 	}
 
-	list, err := s.store.List(args)
+	list, err := s.store.List(ctx, args)
 	if err != nil {
 		return nil, err
 	}
@@ -415,9 +535,9 @@ func (s *StoreSync) syncOut(timestamp int64, limit int) (*SyncPayload, error) {
 	lastSyncTimestamp := timestamp
 
 	for _, kv := range list {
-		item, err := s.getValue(kv.Value)
+		item, err := s.getValue(ctx, kv.Value)
 		if err != nil {
-			if err == storemd.NotFoundError {
+			if errors.Is(err, storemd.ErrNotFound) {
 				continue
 			}
 			return nil, err
@@ -440,14 +560,14 @@ func (s *StoreSync) syncOut(timestamp int64, limit int) (*SyncPayload, error) {
 // Call with nil to initiate (returns queued items via SyncOut).
 // Call with a payload to process incoming items (SyncIn) and return queued items (SyncOut).
 // Returns nil when there is nothing more to send.
-func (s *StoreSync) Sync(peerID string, incoming *SyncPayload) (*SyncPayload, error) {
+func (s *StoreSync) Sync(ctx context.Context, peerID string, incoming *SyncPayload) (*SyncPayload, error) {
 	if incoming != nil && len(incoming.Items) > 0 {
-		if err := s.SyncIn(peerID, *incoming); err != nil {
+		if err := s.SyncIn(ctx, peerID, *incoming); err != nil {
 			return nil, err
 		}
 	}
 
-	payload, err := s.SyncOut(peerID, MaxSyncOutLimit)
+	payload, err := s.SyncOut(ctx, peerID, MaxSyncOutLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -463,16 +583,19 @@ func (s *StoreSync) Sync(peerID string, incoming *SyncPayload) (*SyncPayload, er
 // The Sync method drives the sync protocol.
 type SyncStore interface {
 	storemd.Store
-	GetItem(key string) (*SyncStoreItem, error)
-	SetItem(app, key, value string) error
-	ListItems(prefix, startAfter string, limit int) ([]SyncStoreItem, error)
+	GetItem(ctx context.Context, key string) (*SyncStoreItem, error)
+	SetItem(ctx context.Context, app, key, value string) error
+	ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]SyncStoreItem, error)
 	OnUpdate(fn UpdateListener) func()
 
 	// Sync exchanges data with a peer.
 	// nil incoming = initiate a sync exchange.
 	// Non-nil incoming = process received data and prepare response.
 	// Returns nil when the exchange is complete (no more data to send).
-	Sync(peerID string, incoming *SyncPayload) (*SyncPayload, error)
+	Sync(ctx context.Context, peerID string, incoming *SyncPayload) (*SyncPayload, error)
+
+	// Close stops background workers and releases resources.
+	Close() error
 }
 
 var _ SyncStore = (*StoreSync)(nil)

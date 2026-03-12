@@ -1,8 +1,9 @@
 package client
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	gosync "sync"
 	"time"
@@ -44,6 +45,8 @@ type managedConn struct {
 type Client struct {
 	store    storesync.SyncStore
 	interval time.Duration
+	logger   *slog.Logger
+	maxConns int
 
 	connsMu gosync.RWMutex
 	conns   []*managedConn
@@ -52,6 +55,10 @@ type Client struct {
 	// The OnUpdate callback skips items with these IDs to avoid pushing
 	// data back to the peer that just sent it.
 	syncInIDs gosync.Map
+
+	// notifyCh coalesces rapid OnUpdate notifications into a single
+	// syncActive + broadcast cycle, avoiding 2 goroutines per update.
+	notifyCh chan struct{}
 
 	wg     gosync.WaitGroup // tracks all background goroutines
 	done   chan struct{}
@@ -68,29 +75,74 @@ func WithInterval(d time.Duration) Option {
 	return func(c *Client) { c.interval = d }
 }
 
+// WithLogger sets the structured logger for the client.
+func WithLogger(l *slog.Logger) Option {
+	return func(c *Client) { c.logger = l }
+}
+
+// WithMaxConns sets the maximum number of connections. Default is 100.
+func WithMaxConns(n int) Option {
+	return func(c *Client) { c.maxConns = n }
+}
+
 // New creates a Client that syncs the given store over connections.
 func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
 		store:    store,
 		interval: 5 * time.Second,
+		logger:   slog.Default(),
+		maxConns: 100,
 		done:     make(chan struct{}),
+		notifyCh: make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(c)
 	}
 
-	// Subscribe to local updates. On update, initiate sync on active
-	// connections and broadcast sync_update to passive connections.
+	// Start the coalescing notification goroutine.
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.notifyLoop()
+	}()
+
+	// Subscribe to local updates. On update, send a non-blocking signal
+	// to the notify channel which coalesces rapid notifications.
 	c.unsub = c.store.OnUpdate(func(item storesync.SyncStoreItem) {
 		if _, ok := c.syncInIDs.Load(item.ID); ok {
 			return
 		}
-		c.wg.Add(2)
-		go func() { defer c.wg.Done(); c.syncActive() }()
-		go func() { defer c.wg.Done(); c.broadcast(nil) }()
+		// Non-blocking send — if there's already a pending notification, skip.
+		select {
+		case c.notifyCh <- struct{}{}:
+		default:
+		}
 	})
 
 	return c
+}
+
+// notifyLoop reads from the notify channel and coalesces rapid notifications
+// into a single syncActive + broadcast cycle.
+func (c *Client) notifyLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-c.notifyCh:
+			// Drain any additional queued notifications to coalesce.
+			draining := true
+			for draining {
+				select {
+				case <-c.notifyCh:
+				default:
+					draining = false
+				}
+			}
+			c.syncActive()
+			c.broadcast(nil)
+		}
+	}
 }
 
 // Connect dials a remote WebSocket server and starts actively syncing.
@@ -117,6 +169,13 @@ func (c *Client) addConn(conn Connection, active bool) error {
 		return fmt.Errorf("client is closed")
 	}
 	c.mu.Unlock()
+
+	c.connsMu.Lock()
+	if len(c.conns) >= c.maxConns {
+		c.connsMu.Unlock()
+		return fmt.Errorf("maximum connections reached (%d)", c.maxConns)
+	}
+	c.connsMu.Unlock()
 
 	mc := &managedConn{
 		Connection: conn,
@@ -210,9 +269,10 @@ func (c *Client) Close() error {
 // Always sends a message, even if Sync returns nil, so the remote side gets
 // a chance to respond with its own data.
 func (c *Client) initiateSync(mc *managedConn) {
-	payload, err := c.store.Sync(mc.PeerID(), nil)
+	ctx := context.Background()
+	payload, err := c.store.Sync(ctx, mc.PeerID(), nil)
 	if err != nil {
-		log.Printf("sync client: initiate error: %v", err)
+		c.logger.Error("initiate sync failed", "err", err)
 		return
 	}
 	if payload == nil {
@@ -223,7 +283,7 @@ func (c *Client) initiateSync(mc *managedConn) {
 	err = mc.WriteMessage(Message{Type: "sync", Payload: payload})
 	mc.mu.Unlock()
 	if err != nil {
-		log.Printf("sync client: send error: %v", err)
+		c.logger.Error("send error during initiate sync", "err", err)
 	}
 }
 
@@ -260,7 +320,7 @@ func (c *Client) broadcast(sender *managedConn) {
 		err := mc.WriteMessage(msg)
 		mc.mu.Unlock()
 		if err != nil {
-			log.Printf("sync client: broadcast error: %v", err)
+			c.logger.Error("broadcast error", "err", err)
 		}
 	}
 }
@@ -268,6 +328,7 @@ func (c *Client) broadcast(sender *managedConn) {
 // readLoop reads messages from a connection and handles them.
 func (c *Client) readLoop(mc *managedConn) {
 	defer c.removeConn(mc)
+	ctx := context.Background()
 	for {
 		msg, err := mc.ReadMessage()
 		if err != nil {
@@ -275,7 +336,7 @@ func (c *Client) readLoop(mc *managedConn) {
 			case <-mc.done:
 			case <-c.done:
 			default:
-				log.Printf("sync client: read error: %v", err)
+				c.logger.Error("read error", "err", err)
 			}
 			return
 		}
@@ -286,19 +347,26 @@ func (c *Client) readLoop(mc *managedConn) {
 				continue
 			}
 
-			// Track incoming item IDs to suppress re-broadcast.
+			// Track incoming item IDs so the OnUpdate callback can suppress
+			// re-broadcasting items back to the peer that sent them. This
+			// prevents echo loops: without this, receiving items via Sync
+			// would trigger OnUpdate, which would try to push those same
+			// items back to the sender.
 			for i := range msg.Payload.Items {
 				c.syncInIDs.Store(msg.Payload.Items[i].ID, struct{}{})
 			}
 
-			response, err := c.store.Sync(mc.PeerID(), msg.Payload)
+			response, err := c.store.Sync(ctx, mc.PeerID(), msg.Payload)
 
+			// Clean up tracked IDs after Sync completes, regardless of
+			// success or failure.
 			for i := range msg.Payload.Items {
 				c.syncInIDs.Delete(msg.Payload.Items[i].ID)
 			}
 
 			if err != nil {
-				log.Printf("sync client: Sync error: %v", err)
+				c.logger.Error("sync processing error", "err", err)
+				// Never send internal error details to peers.
 				mc.mu.Lock()
 				mc.WriteMessage(Message{Type: "error", Error: "internal error"})
 				mc.mu.Unlock()
@@ -317,7 +385,7 @@ func (c *Client) readLoop(mc *managedConn) {
 				err = mc.WriteMessage(Message{Type: "sync", Payload: response})
 				mc.mu.Unlock()
 				if err != nil {
-					log.Printf("sync client: send error: %v", err)
+					c.logger.Error("send error", "err", err)
 				}
 			}
 
@@ -327,7 +395,7 @@ func (c *Client) readLoop(mc *managedConn) {
 			go func() { defer c.wg.Done(); c.initiateSync(mc) }()
 
 		case "error":
-			log.Printf("sync client: remote error: %s", msg.Error)
+			c.logger.Error("remote error", "msg", msg.Error)
 		}
 	}
 }

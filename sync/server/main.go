@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	gosync "sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/readmedotmd/store.md/sync/client"
@@ -19,6 +21,12 @@ type Authorizer func(r *http.Request) (peerID string, err error)
 // It is called once per WebSocket connection. Return an error to reject the connection.
 type StoreResolver func(storeID string) (storesync.SyncStore, error)
 
+// TokenInfo describes a token with optional expiration for use with TokenAuthWithExpiry.
+type TokenInfo struct {
+	PeerID    string
+	ExpiresAt time.Time // zero means never expires
+}
+
 // Server is a WebSocket sync server that accepts incoming connections and
 // delegates sync protocol handling to the client adapter.
 type Server struct {
@@ -26,18 +34,41 @@ type Server struct {
 	resolver StoreResolver       // multi-store mode (nil when using single store)
 	auth     Authorizer
 	upgrader websocket.Upgrader
+	logger   *slog.Logger
+
+	maxConnsPerPeer int
+	maxTotalConns   int
+
+	// Connection tracking
+	connsMu    gosync.Mutex
+	totalConns int
+	peerConns  map[string]int
+
+	// Rate limiting for auth failures (per IP)
+	authFailMu    gosync.Mutex
+	authFailCount map[string]*authFailEntry
 
 	adaptersMu gosync.Mutex
 	adapters   map[storesync.SyncStore]*client.Client
 }
 
+type authFailEntry struct {
+	count     int
+	resetAt   time.Time
+}
+
 // New creates a single-store server. All connections share the same StoreSync.
 func New(store storesync.SyncStore, auth Authorizer) *Server {
 	s := &Server{
-		store:    store,
-		auth:     auth,
-		upgrader: websocket.Upgrader{},
-		adapters: make(map[storesync.SyncStore]*client.Client),
+		store:           store,
+		auth:            auth,
+		upgrader:        websocket.Upgrader{},
+		logger:          slog.Default(),
+		maxConnsPerPeer: 10,
+		maxTotalConns:   1000,
+		peerConns:       make(map[string]int),
+		authFailCount:   make(map[string]*authFailEntry),
+		adapters:        make(map[storesync.SyncStore]*client.Client),
 	}
 	s.adapters[store] = client.New(store)
 	return s
@@ -47,15 +78,37 @@ func New(store storesync.SyncStore, auth Authorizer) *Server {
 // path — connect to /sync/{storeID} and the resolver maps storeID to a StoreSync.
 func NewMulti(resolver StoreResolver, auth Authorizer) *Server {
 	return &Server{
-		resolver: resolver,
-		auth:     auth,
-		upgrader: websocket.Upgrader{},
-		adapters: make(map[storesync.SyncStore]*client.Client),
+		resolver:        resolver,
+		auth:            auth,
+		upgrader:        websocket.Upgrader{},
+		logger:          slog.Default(),
+		maxConnsPerPeer: 10,
+		maxTotalConns:   1000,
+		peerConns:       make(map[string]int),
+		authFailCount:   make(map[string]*authFailEntry),
+		adapters:        make(map[storesync.SyncStore]*client.Client),
 	}
 }
 
+// SetLogger sets the structured logger for the server.
+func (s *Server) SetLogger(l *slog.Logger) {
+	s.logger = l
+}
+
+// SetMaxConnsPerPeer sets the maximum connections per peer. Default is 10.
+func (s *Server) SetMaxConnsPerPeer(n int) {
+	s.maxConnsPerPeer = n
+}
+
+// SetMaxTotalConns sets the maximum total connections. Default is 1000.
+func (s *Server) SetMaxTotalConns(n int) {
+	s.maxTotalConns = n
+}
+
 // SetAllowedOrigins configures which origins are allowed for WebSocket connections.
-// Pass "*" to allow all origins (not recommended for production).
+// In production, always specify exact origins. Never use "*" in production as it
+// allows any website to connect to your sync server.
+// Example: SetAllowedOrigins([]string{"https://myapp.example.com"})
 func (s *Server) SetAllowedOrigins(origins []string) {
 	s.upgrader.CheckOrigin = func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
@@ -81,6 +134,26 @@ func TokenAuth(tokens map[string]string) Authorizer {
 			return "", fmt.Errorf("invalid token")
 		}
 		return peerID, nil
+	}
+}
+
+// TokenAuthWithExpiry returns an Authorizer that validates Bearer tokens with
+// optional expiration support.
+func TokenAuthWithExpiry(tokens map[string]TokenInfo) Authorizer {
+	return func(r *http.Request) (string, error) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			return "", fmt.Errorf("missing or invalid Authorization header")
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		info, ok := tokens[token]
+		if !ok {
+			return "", fmt.Errorf("invalid token")
+		}
+		if !info.ExpiresAt.IsZero() && time.Now().After(info.ExpiresAt) {
+			return "", fmt.Errorf("token expired")
+		}
+		return info.PeerID, nil
 	}
 }
 
@@ -111,6 +184,63 @@ func (s *Server) getAdapter(store storesync.SyncStore) *client.Client {
 	return a
 }
 
+// checkAuthRateLimit returns true if the IP has exceeded the auth failure limit.
+func (s *Server) checkAuthRateLimit(ip string) bool {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	entry, ok := s.authFailCount[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().After(entry.resetAt) {
+		delete(s.authFailCount, ip)
+		return false
+	}
+	return entry.count >= 10
+}
+
+// recordAuthFailure records an auth failure for the given IP.
+func (s *Server) recordAuthFailure(ip string) {
+	s.authFailMu.Lock()
+	defer s.authFailMu.Unlock()
+	entry, ok := s.authFailCount[ip]
+	if !ok || time.Now().After(entry.resetAt) {
+		s.authFailCount[ip] = &authFailEntry{
+			count:   1,
+			resetAt: time.Now().Add(1 * time.Minute),
+		}
+		return
+	}
+	entry.count++
+}
+
+// acquireConn attempts to acquire a connection slot for the given peer.
+// Returns an error if limits are exceeded.
+func (s *Server) acquireConn(peerID string) error {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.totalConns >= s.maxTotalConns {
+		return fmt.Errorf("maximum total connections reached (%d)", s.maxTotalConns)
+	}
+	if s.peerConns[peerID] >= s.maxConnsPerPeer {
+		return fmt.Errorf("maximum connections per peer reached (%d)", s.maxConnsPerPeer)
+	}
+	s.totalConns++
+	s.peerConns[peerID]++
+	return nil
+}
+
+// releaseConn releases a connection slot for the given peer.
+func (s *Server) releaseConn(peerID string) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	s.totalConns--
+	s.peerConns[peerID]--
+	if s.peerConns[peerID] <= 0 {
+		delete(s.peerConns, peerID)
+	}
+}
+
 // notifyConn wraps a Connection and signals a channel when ReadMessage returns an error.
 type notifyConn struct {
 	client.Connection
@@ -132,21 +262,40 @@ func (n *notifyConn) Close() error {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Rate limit auth failures by IP.
+	ip := r.RemoteAddr
+	if idx := strings.LastIndex(ip, ":"); idx >= 0 {
+		ip = ip[:idx]
+	}
+	if s.checkAuthRateLimit(ip) {
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
 	peerID, err := s.auth(r)
 	if err != nil {
+		s.recordAuthFailure(ip)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	store, err := s.resolveStore(r)
 	if err != nil {
-		log.Printf("resolveStore error: %v", err)
+		s.logger.Error("resolveStore error", "err", err)
 		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	// Check connection limits.
+	if err := s.acquireConn(peerID); err != nil {
+		s.logger.Warn("connection limit reached", "peer", peerID, "err", err)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
 
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		s.releaseConn(peerID)
 		return
 	}
 
@@ -157,8 +306,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	adapter := s.getAdapter(store)
 	if err := adapter.AddConnection(conn); err != nil {
-		log.Printf("AddConnection error: %v", err)
+		s.logger.Error("AddConnection error", "err", err)
 		ws.Close()
+		s.releaseConn(peerID)
 		return
 	}
 
@@ -166,6 +316,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// all protocol messages. The notifyConn signals done when ReadMessage
 	// returns an error (i.e. the connection dropped).
 	<-conn.done
+	s.releaseConn(peerID)
 }
 
 // ListenAndServe starts an HTTP server on the given address.
@@ -175,9 +326,21 @@ func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, mux)
 }
 
+// ListenAndServeTLS starts an HTTPS server on the given address.
+func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
+	mux := http.NewServeMux()
+	mux.Handle("/", s)
+	return http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+}
+
 // Close closes all client adapters managed by this server, waiting for their
 // goroutines to drain. Call this before closing the underlying stores.
 func (s *Server) Close() error {
+	return s.CloseWithContext(context.Background())
+}
+
+// CloseWithContext closes all client adapters with context-aware shutdown support.
+func (s *Server) CloseWithContext(ctx context.Context) error {
 	s.adaptersMu.Lock()
 	adapters := make([]*client.Client, 0, len(s.adapters))
 	for _, a := range s.adapters {
@@ -185,13 +348,23 @@ func (s *Server) Close() error {
 	}
 	s.adaptersMu.Unlock()
 
-	var firstErr error
-	for _, a := range adapters {
-		if err := a.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	done := make(chan error, 1)
+	go func() {
+		var firstErr error
+		for _, a := range adapters {
+			if err := a.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
+		done <- firstErr
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return firstErr
 }
 
 var _ http.Handler = (*Server)(nil)

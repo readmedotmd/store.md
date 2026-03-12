@@ -83,7 +83,7 @@ func (m *StoreMessage) SyncStore() *core.StoreSync {
 }
 
 // Close unsubscribes from the sync store and cancels any pending sends.
-func (m *StoreMessage) Close() {
+func (m *StoreMessage) Close() error {
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
@@ -94,22 +94,23 @@ func (m *StoreMessage) Close() {
 		delete(m.pending, id)
 	}
 	m.pendingMu.Unlock()
+	return nil
 }
 
 // --- Store interface ---
 
-func (m *StoreMessage) Get(key string) (string, error)                              { return m.ss.Get(key) }
-func (m *StoreMessage) Set(key, value string) error                                 { return m.ss.Set(key, value) }
-func (m *StoreMessage) Delete(key string) error                                     { return m.ss.Delete(key) }
-func (m *StoreMessage) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error)  { return m.ss.List(args) }
+func (m *StoreMessage) Get(ctx context.Context, key string) (string, error)                              { return m.ss.Get(ctx, key) }
+func (m *StoreMessage) Set(ctx context.Context, key, value string) error                                 { return m.ss.Set(ctx, key, value) }
+func (m *StoreMessage) Delete(ctx context.Context, key string) error                                     { return m.ss.Delete(ctx, key) }
+func (m *StoreMessage) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error)  { return m.ss.List(ctx, args) }
 
 // --- Sync store methods ---
 
-func (m *StoreMessage) GetItem(key string) (*core.SyncStoreItem, error)               { return m.ss.GetItem(key) }
-func (m *StoreMessage) SetItem(app, key, value string) error                          { return m.ss.SetItem(app, key, value) }
-func (m *StoreMessage) ListItems(prefix, startAfter string, limit int) ([]core.SyncStoreItem, error) { return m.ss.ListItems(prefix, startAfter, limit) }
+func (m *StoreMessage) GetItem(ctx context.Context, key string) (*core.SyncStoreItem, error)               { return m.ss.GetItem(ctx, key) }
+func (m *StoreMessage) SetItem(ctx context.Context, app, key, value string) error                          { return m.ss.SetItem(ctx, app, key, value) }
+func (m *StoreMessage) ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]core.SyncStoreItem, error) { return m.ss.ListItems(ctx, prefix, startAfter, limit) }
 func (m *StoreMessage) OnUpdate(fn core.UpdateListener) func()                        { return m.ss.OnUpdate(fn) }
-func (m *StoreMessage) Sync(peerID string, incoming *core.SyncPayload) (*core.SyncPayload, error) { return m.ss.Sync(peerID, incoming) }
+func (m *StoreMessage) Sync(ctx context.Context, peerID string, incoming *core.SyncPayload) (*core.SyncPayload, error) { return m.ss.Sync(ctx, peerID, incoming) }
 
 // --- Messaging API ---
 
@@ -155,7 +156,7 @@ func (m *StoreMessage) Send(ctx context.Context, targetID, msgType, data string)
 		return "", err
 	}
 
-	if err := m.ss.SetItem("msg", reqKey(targetID, messageID), string(encoded)); err != nil {
+	if err := m.ss.SetItem(ctx, "msg", reqKey(targetID, messageID), string(encoded)); err != nil {
 		m.removePending(messageID)
 		return "", err
 	}
@@ -192,7 +193,7 @@ func (m *StoreMessage) sendResponse(messageID, data, errMsg string) error {
 	if err != nil {
 		return err
 	}
-	return m.ss.SetItem("msg", resKey(messageID), string(encoded))
+	return m.ss.SetItem(context.Background(), "msg", resKey(messageID), string(encoded))
 }
 
 func (m *StoreMessage) onSyncUpdate(item core.SyncStoreItem) {
