@@ -1,10 +1,9 @@
 name: Banner
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '.github/banner.svg'
+  workflow_run:
+    workflows: [Tag]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -14,14 +13,18 @@ jobs:
   generate:
     name: Generate Banner
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Extract version
         id: version
         run: |
-          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo 'v0.0.0')
+          VERSION=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$' | head -n1 || echo 'v0.0.0')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Generate banner
