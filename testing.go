@@ -11,6 +11,80 @@ import (
 // StoreFactory is a function that returns a fresh Store instance for testing.
 type StoreFactory func(t *testing.T) Store
 
+// Clearable is implemented by backends that support clearing all data.
+type Clearable interface {
+	Store
+	Clear(ctx context.Context) error
+}
+
+// ClearableFactory is a function that returns a fresh Clearable instance for testing.
+type ClearableFactory func(t *testing.T) Clearable
+
+// RunClearTests runs tests for the Clear method on backends that support it.
+func RunClearTests(t *testing.T, factory ClearableFactory) {
+	ctx := context.Background()
+
+	t.Run("Clear", func(t *testing.T) {
+		s := factory(t)
+		// Insert some data.
+		for _, p := range []KeyValuePair{
+			{"a", "v1"},
+			{"b", "v2"},
+			{"c", "v3"},
+		} {
+			if err := s.Set(ctx, p.Key, p.Value); err != nil {
+				t.Fatalf("Set %q failed: %v", p.Key, err)
+			}
+		}
+		// Clear all data.
+		if err := s.Clear(ctx); err != nil {
+			t.Fatalf("Clear failed: %v", err)
+		}
+		// Verify store is empty.
+		result, err := s.List(ctx, ListArgs{})
+		if err != nil {
+			t.Fatalf("List after Clear failed: %v", err)
+		}
+		if len(result) != 0 {
+			t.Fatalf("expected empty store after Clear, got %d items", len(result))
+		}
+	})
+
+	t.Run("Clear_Empty", func(t *testing.T) {
+		s := factory(t)
+		// Clear on an already-empty store should not error.
+		if err := s.Clear(ctx); err != nil {
+			t.Fatalf("Clear on empty store failed: %v", err)
+		}
+	})
+
+	t.Run("Clear_ThenReuse", func(t *testing.T) {
+		s := factory(t)
+		// Insert, clear, then insert again.
+		if err := s.Set(ctx, "key1", "value1"); err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
+		if err := s.Clear(ctx); err != nil {
+			t.Fatalf("Clear failed: %v", err)
+		}
+		if err := s.Set(ctx, "key2", "value2"); err != nil {
+			t.Fatalf("Set after Clear failed: %v", err)
+		}
+		val, err := s.Get(ctx, "key2")
+		if err != nil {
+			t.Fatalf("Get after Clear failed: %v", err)
+		}
+		if val != "value2" {
+			t.Fatalf("expected %q, got %q", "value2", val)
+		}
+		// Original key should still be gone.
+		_, err = s.Get(ctx, "key1")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound for cleared key, got %v", err)
+		}
+	})
+}
+
 // RunStoreTests runs the full generic test suite against any Store implementation.
 func RunStoreTests(t *testing.T, factory StoreFactory) {
 	ctx := context.Background()

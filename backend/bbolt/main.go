@@ -39,6 +39,17 @@ func (s *StoreBBolt) Close() error {
 	return s.db.Close()
 }
 
+// Clear removes all key-value pairs from the store.
+func (s *StoreBBolt) Clear(ctx context.Context) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.DeleteBucket(bucketName); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(bucketName)
+		return err
+	})
+}
+
 func (s *StoreBBolt) Get(ctx context.Context, key string) (string, error) {
 	var value string
 	err := s.db.View(func(tx *bolt.Tx) error {

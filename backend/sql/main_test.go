@@ -25,3 +25,20 @@ func TestSQLStore(t *testing.T) {
 		return store
 	})
 }
+
+func TestSQLStore_Clear(t *testing.T) {
+	storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+		dbPath := filepath.Join(t.TempDir(), "test.db")
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatalf("failed to open sqlite: %v", err)
+		}
+		t.Cleanup(func() { db.Close() })
+
+		store, err := New(db)
+		if err != nil {
+			t.Fatalf("failed to create store: %v", err)
+		}
+		return store
+	})
+}

@@ -49,6 +49,14 @@ func (s *StoreMemory) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Clear removes all key-value pairs from the store.
+func (s *StoreMemory) Clear(ctx context.Context) error {
+	s.mu.Lock()
+	s.data = make(map[string]string)
+	s.mu.Unlock()
+	return nil
+}
+
 func (s *StoreMemory) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

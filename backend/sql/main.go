@@ -64,6 +64,12 @@ func (s *StoreSQL) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Clear removes all key-value pairs from the store.
+func (s *StoreSQL) Clear(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM kv_store")
+	return err
+}
+
 func (s *StoreSQL) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	query := "SELECT key, value FROM kv_store"
 	var queryArgs []interface{}

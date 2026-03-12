@@ -34,6 +34,18 @@ func (s *StoreIndexedDB) Close() error {
 	return nil
 }
 
+// Clear removes all key-value pairs from the store.
+func (s *StoreIndexedDB) Clear(ctx context.Context) error {
+	ch := make(chan error, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readwrite")
+		store := tx.Call("objectStore", s.storeName)
+		store.Call("clear")
+		ch <- awaitTransaction(tx)
+	}()
+	return <-ch
+}
+
 func (s *StoreIndexedDB) Get(ctx context.Context, key string) (string, error) {
 	type result struct {
 		val string

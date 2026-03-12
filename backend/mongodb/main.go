@@ -34,6 +34,14 @@ func New(col *mongo.Collection) *StoreMongo {
 	return &StoreMongo{col: col}
 }
 
+// Clear removes all key-value pairs from the collection.
+func (s *StoreMongo) Clear(ctx context.Context) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	_, err := s.col.DeleteMany(ctx, bson.M{})
+	return err
+}
+
 func (s *StoreMongo) Get(ctx context.Context, key string) (string, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

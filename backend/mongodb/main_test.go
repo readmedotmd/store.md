@@ -59,3 +59,10 @@ func TestStore(t *testing.T) {
 		return New(col)
 	})
 }
+
+func TestStore_Clear(t *testing.T) {
+	storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+		col := mongoClient.Database("testdb").Collection(t.Name())
+		return New(col)
+	})
+}

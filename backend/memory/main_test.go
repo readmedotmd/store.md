@@ -11,3 +11,9 @@ func TestMemoryStore(t *testing.T) {
 		return New()
 	})
 }
+
+func TestMemoryStore_Clear(t *testing.T) {
+	storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+		return New()
+	})
+}

@@ -21,3 +21,18 @@ func TestBBoltStore(t *testing.T) {
 		return s
 	})
 }
+
+func TestBBoltStore_Clear(t *testing.T) {
+	storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+		s, err := New(dbPath)
+		if err != nil {
+			t.Fatalf("failed to create bbolt store: %v", err)
+		}
+		t.Cleanup(func() {
+			s.Close()
+		})
+		return s
+	})
+}

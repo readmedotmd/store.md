@@ -22,7 +22,29 @@ func TestMyStore(t *testing.T) {
 
 The factory function is called once per sub-test, so each test gets an isolated store.
 
+## Clear Test Suite
+
+The `storemd.RunClearTests` function tests the `Clear` method for backends that support it. It uses the `storemd.Clearable` interface (which embeds `Store` and adds `Clear`).
+
+### Usage
+
+```go
+func TestMyStore_Clear(t *testing.T) {
+    storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+        return createMyStore(t)
+    })
+}
+```
+
 ### What's Tested
+
+| Test | What it verifies |
+|------|-----------------|
+| `Clear` | All data is removed after Clear |
+| `Clear_Empty` | Clear on an empty store does not error |
+| `Clear_ThenReuse` | Store is fully usable after Clear, old keys are gone |
+
+## Store Test Suite — What's Tested
 
 | Test | What it verifies |
 |------|-----------------|

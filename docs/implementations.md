@@ -2,6 +2,8 @@
 
 All implementations satisfy the `storemd.Store` interface and pass the generic test suite. All Store methods accept a `context.Context` as the first parameter, enabling cancellation and timeout propagation.
 
+Most backends also provide a `Clear(ctx context.Context) error` method that removes all key-value pairs. This is available on the concrete type (not the `Store` interface) since not all backends support it efficiently. Use `storemd.Clearable` for type assertions. S3 does not support `Clear`.
+
 ---
 
 ## BBolt — `backend/bbolt/`
@@ -17,6 +19,8 @@ defer store.Close()
 
 **Best for:** CLI tools, desktop apps, single-process services.
 
+**Clear:** `store.Clear(ctx)` deletes and recreates the internal bucket.
+
 ---
 
 ## Badger — `backend/badger/`
@@ -31,6 +35,8 @@ defer store.Close()
 ```
 
 **Best for:** High-throughput local workloads, write-heavy applications.
+
+**Clear:** `store.Clear(ctx)` calls `db.DropAll()`.
 
 ---
 
@@ -60,6 +66,8 @@ CREATE TABLE IF NOT EXISTS kv_store (
 ```
 
 **Best for:** Projects already using SQL, relational database integration, SQLite deployments.
+
+**Clear:** `store.Clear(ctx)` runs `DELETE FROM kv_store`.
 
 ---
 
@@ -113,6 +121,8 @@ Documents are stored as `{_id: key, value: value}`. List uses regex for prefix f
 
 **Best for:** Document-oriented projects, existing MongoDB infrastructure.
 
+**Clear:** `store.Clear(ctx)` runs `DeleteMany({})` on the collection.
+
 **Context:** MongoDB operations respect context deadlines and cancellation. The default timeout is 30 seconds when no deadline is set on the context.
 
 ---
@@ -135,6 +145,8 @@ store := redisstore.New(client, "myapp:") // key prefix for namespacing
 `List` uses `SCAN` + sort + `MGET` since Redis doesn't have native ordered iteration.
 
 **Best for:** Caching layers, shared state across services, pub/sub systems.
+
+**Clear:** `store.Clear(ctx)` scans and deletes all keys matching the store's prefix.
 
 **Note:** Key prefix is recommended to avoid collisions in shared Redis instances.
 
@@ -164,6 +176,8 @@ GOOS=js GOARCH=wasm go build -o app.wasm
 Values are stored in a `kv` object store. Cursor iteration provides lexicographic key ordering for `List`.
 
 **Best for:** Browser apps, PWAs, offline-first web applications.
+
+**Clear:** `store.Clear(ctx)` calls `objectStore.clear()` on the IndexedDB object store.
 
 **Note:** Requires `GOOS=js GOARCH=wasm` build target. Tests need a browser or JS runtime with IndexedDB support.
 

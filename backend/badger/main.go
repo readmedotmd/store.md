@@ -30,6 +30,11 @@ func (s *StoreBadger) Close() error {
 	return s.db.Close()
 }
 
+// Clear removes all key-value pairs from the store.
+func (s *StoreBadger) Clear(ctx context.Context) error {
+	return s.db.DropAll()
+}
+
 func (s *StoreBadger) Get(ctx context.Context, key string) (string, error) {
 	var val string
 	err := s.db.View(func(txn *badgerdb.Txn) error {

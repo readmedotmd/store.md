@@ -59,3 +59,13 @@ func TestRedisStore(t *testing.T) {
 		return New(client, prefix)
 	})
 }
+
+func TestRedisStore_Clear(t *testing.T) {
+	storemd.RunClearTests(t, func(t *testing.T) storemd.Clearable {
+		client := redis.NewClient(&redis.Options{Addr: redisAddr})
+		t.Cleanup(func() { client.Close() })
+
+		prefix := t.Name() + ":"
+		return New(client, prefix)
+	})
+}

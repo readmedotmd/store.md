@@ -43,6 +43,31 @@ func (s *StoreRedis) userKey(redisKey string) string {
 	return strings.TrimPrefix(redisKey, s.prefix)
 }
 
+// Clear removes all key-value pairs managed by this store (matching the key prefix).
+func (s *StoreRedis) Clear(ctx context.Context) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	var cursor uint64
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = s.client.Scan(ctx, cursor, s.prefix+"*", 100).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := s.client.Del(ctx, keys...).Err(); err != nil {
+				return err
+			}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	return nil
+}
+
 func (s *StoreRedis) Get(ctx context.Context, key string) (string, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
