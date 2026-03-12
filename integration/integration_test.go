@@ -577,6 +577,275 @@ func TestLargePayloadSync(t *testing.T) {
 	}
 }
 
+// recordingConn wraps a client.Connection and records all sent/received messages.
+type recordingConn struct {
+	inner client.Connection
+	mu    sync.Mutex
+	sent  []client.Message
+	recv  []client.Message
+}
+
+func newRecordingConn(inner client.Connection) *recordingConn {
+	return &recordingConn{inner: inner}
+}
+
+func (r *recordingConn) PeerID() string { return r.inner.PeerID() }
+
+func (r *recordingConn) ReadMessage() (client.Message, error) {
+	msg, err := r.inner.ReadMessage()
+	if err == nil {
+		r.mu.Lock()
+		r.recv = append(r.recv, msg)
+		r.mu.Unlock()
+	}
+	return msg, err
+}
+
+func (r *recordingConn) WriteMessage(msg client.Message) error {
+	err := r.inner.WriteMessage(msg)
+	if err == nil {
+		r.mu.Lock()
+		r.sent = append(r.sent, msg)
+		r.mu.Unlock()
+	}
+	return err
+}
+
+func (r *recordingConn) Close() error { return r.inner.Close() }
+
+func (r *recordingConn) Sent() []client.Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]client.Message, len(r.sent))
+	copy(out, r.sent)
+	return out
+}
+
+func (r *recordingConn) Recv() []client.Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]client.Message, len(r.recv))
+	copy(out, r.recv)
+	return out
+}
+
+// resetRecording clears recorded messages (useful between test phases).
+func (r *recordingConn) resetRecording() {
+	r.mu.Lock()
+	r.sent = nil
+	r.recv = nil
+	r.mu.Unlock()
+}
+
+// uniqueItemKeys returns the set of unique item keys across all sync messages.
+func uniqueItemKeys(msgs []client.Message) map[string]bool {
+	keys := make(map[string]bool)
+	for _, msg := range msgs {
+		if msg.Type == "sync" && msg.Payload != nil {
+			for _, item := range msg.Payload.Items {
+				keys[item.Key] = true
+			}
+		}
+	}
+	return keys
+}
+
+// TestNetworkEfficiency_WriteAfterSync verifies that after an initial sync,
+// writes on client and server only produce messages carrying the new items —
+// no empty payloads, and only the expected item keys appear in the traffic.
+func TestNetworkEfficiency_WriteAfterSync(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range factories {
+		t.Run(f.Name, func(t *testing.T) {
+			serverStore := f.NewStore(t)
+			serverStore.SetItem(ctx, "app", "initial", "value")
+
+			ts := startServer(t, serverStore)
+
+			clientStore := f.NewStore(t)
+			c := newClient(clientStore)
+			defer c.Close()
+
+			// Dial manually so we can wrap with recording conn.
+			conn, err := client.Dial("server-peer", wsURL(ts), header("token-a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := newRecordingConn(conn)
+			if err := c.AddConnection(rec); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait for initial sync to complete and time offset window to pass.
+			pollFor(t, 3*time.Second, "client gets initial", func() bool {
+				v, err := clientStore.Get(ctx, "initial")
+				return err == nil && v == "value"
+			})
+			// Wait for the time offset window (100ms) to pass so cursors settle.
+			time.Sleep(300 * time.Millisecond)
+			rec.resetRecording()
+
+			// --- Phase 1: Client writes a new item ---
+			if err := clientStore.SetItem(ctx, "app", "client-write", "cval"); err != nil {
+				t.Fatal(err)
+			}
+
+			pollFor(t, 3*time.Second, "server gets client-write", func() bool {
+				v, err := serverStore.Get(ctx, "client-write")
+				return err == nil && v == "cval"
+			})
+			time.Sleep(300 * time.Millisecond)
+
+			sent := rec.Sent()
+			if len(sent) == 0 {
+				t.Error("expected at least one sent message after client write")
+			}
+			// Every sent sync message must carry items (no empty payloads).
+			for i, msg := range sent {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("sent message %d is an empty sync payload (no items)", i)
+				}
+			}
+			// The new item must appear in sent messages.
+			sentKeys := uniqueItemKeys(sent)
+			if !sentKeys["client-write"] {
+				t.Error("client-write not found in sent messages")
+			}
+			t.Logf("client write phase: %d sent, %d recv, sent keys: %v",
+				len(sent), len(rec.Recv()), sentKeys)
+
+			// --- Phase 2: Server writes a new item ---
+			rec.resetRecording()
+
+			if err := serverStore.SetItem(ctx, "app", "server-write", "sval"); err != nil {
+				t.Fatal(err)
+			}
+
+			pollFor(t, 3*time.Second, "client gets server-write", func() bool {
+				v, err := clientStore.Get(ctx, "server-write")
+				return err == nil && v == "sval"
+			})
+			time.Sleep(300 * time.Millisecond)
+
+			recv := rec.Recv()
+			if len(recv) == 0 {
+				t.Error("expected at least one received message after server write")
+			}
+			// The received messages should contain the server-write item.
+			recvKeys := uniqueItemKeys(recv)
+			if !recvKeys["server-write"] {
+				t.Error("server-write not found in received messages")
+			}
+			t.Logf("server write phase: %d sent, %d recv, recv keys: %v",
+				len(rec.Sent()), len(recv), recvKeys)
+		})
+	}
+}
+
+// TestNetworkEfficiency_Reconnect verifies that reconnecting a store that
+// already has data only exchanges the items that changed since disconnect —
+// not a full re-sync of everything.
+func TestNetworkEfficiency_Reconnect(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range factories {
+		t.Run(f.Name, func(t *testing.T) {
+			serverStore := f.NewStore(t)
+
+			// Seed server with initial data.
+			for i := range 5 {
+				serverStore.SetItem(ctx, "app", fmt.Sprintf("pre-%d", i), fmt.Sprintf("val-%d", i))
+			}
+
+			ts := startServer(t, serverStore)
+
+			clientStore := f.NewStore(t)
+			c1 := newClient(clientStore)
+
+			if err := c1.Connect("server-peer", wsURL(ts), header("token-a")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait for initial sync and the time offset window to pass.
+			pollFor(t, 3*time.Second, "client gets pre-4", func() bool {
+				v, err := clientStore.Get(ctx, "pre-4")
+				return err == nil && v == "val-4"
+			})
+			// Wait for cursors to fully advance past the time offset window.
+			time.Sleep(300 * time.Millisecond)
+
+			// Disconnect.
+			c1.Close()
+			time.Sleep(100 * time.Millisecond)
+
+			// Server writes one new item while client is disconnected.
+			if err := serverStore.SetItem(ctx, "app", "new-after-disconnect", "new-val"); err != nil {
+				t.Fatal(err)
+			}
+
+			// Reconnect with recording connection.
+			c2 := newClient(clientStore)
+			defer c2.Close()
+
+			conn, err := client.Dial("server-peer", wsURL(ts), header("token-a"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := newRecordingConn(conn)
+			if err := c2.AddConnection(rec); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait for the new item to arrive.
+			pollFor(t, 3*time.Second, "client gets new-after-disconnect", func() bool {
+				v, err := clientStore.Get(ctx, "new-after-disconnect")
+				return err == nil && v == "new-val"
+			})
+			time.Sleep(300 * time.Millisecond)
+
+			// Collect unique item keys received from server.
+			recv := rec.Recv()
+			recvKeys := uniqueItemKeys(recv)
+
+			t.Logf("reconnect phase: %d messages recv, %d messages sent, unique keys recv: %v",
+				len(recv), len(rec.Sent()), recvKeys)
+
+			// The new item must be present.
+			if !recvKeys["new-after-disconnect"] {
+				t.Error("new-after-disconnect not found in received messages")
+			}
+
+			// Pre-existing items that the client already has should NOT be re-sent.
+			resent := 0
+			for i := range 5 {
+				if recvKeys[fmt.Sprintf("pre-%d", i)] {
+					resent++
+				}
+			}
+			if resent > 0 {
+				t.Errorf("server re-sent %d of 5 pre-existing items on reconnect (expected 0)", resent)
+			}
+
+			// Verify all data is present on the client.
+			for i := range 5 {
+				v, err := clientStore.Get(ctx, fmt.Sprintf("pre-%d", i))
+				if err != nil {
+					t.Fatalf("missing pre-%d after reconnect: %v", i, err)
+				}
+				if v != fmt.Sprintf("val-%d", i) {
+					t.Fatalf("pre-%d = %q, want %q", i, v, fmt.Sprintf("val-%d", i))
+				}
+			}
+			v, err := clientStore.Get(ctx, "new-after-disconnect")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v != "new-val" {
+				t.Fatalf("new-after-disconnect = %q, want %q", v, "new-val")
+			}
+		})
+	}
+}
+
 func TestReconnect(t *testing.T) {
 	ctx := context.Background()
 	for _, f := range factories {

@@ -1,6 +1,7 @@
 package client_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -42,12 +43,13 @@ func authHeader(token string) http.Header {
 }
 
 func TestClient_PullFromServer(t *testing.T) {
+	ctx := context.Background()
 	serverStore := newSyncStore(t)
 
-	if err := serverStore.SetItem("app", "key1", "val1"); err != nil {
+	if err := serverStore.SetItem(ctx, "app", "key1", "val1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := serverStore.SetItem("app", "key2", "val2"); err != nil {
+	if err := serverStore.SetItem(ctx, "app", "key2", "val2"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -63,7 +65,7 @@ func TestClient_PullFromServer(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	v1, err := clientStore.Get("key1")
+	v1, err := clientStore.Get(ctx, "key1")
 	if err != nil {
 		t.Fatalf("Get key1: %v", err)
 	}
@@ -71,7 +73,7 @@ func TestClient_PullFromServer(t *testing.T) {
 		t.Fatalf("expected val1, got %q", v1)
 	}
 
-	v2, err := clientStore.Get("key2")
+	v2, err := clientStore.Get(ctx, "key2")
 	if err != nil {
 		t.Fatalf("Get key2: %v", err)
 	}
@@ -81,6 +83,7 @@ func TestClient_PullFromServer(t *testing.T) {
 }
 
 func TestClient_PushToServer(t *testing.T) {
+	ctx := context.Background()
 	serverStore := newSyncStore(t)
 	ts := startServer(t, serverStore)
 
@@ -96,13 +99,13 @@ func TestClient_PushToServer(t *testing.T) {
 	// so the push doesn't race with it.
 	time.Sleep(200 * time.Millisecond)
 
-	if err := clientStore.SetItem("app", "pushed-key", "pushed-val"); err != nil {
+	if err := clientStore.SetItem(ctx, "app", "pushed-key", "pushed-val"); err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
-	item, err := serverStore.GetItem("pushed-key")
+	item, err := serverStore.GetItem(ctx, "pushed-key")
 	if err != nil {
 		t.Fatalf("GetItem: %v", err)
 	}
@@ -112,6 +115,7 @@ func TestClient_PushToServer(t *testing.T) {
 }
 
 func TestClient_Broadcast(t *testing.T) {
+	ctx := context.Background()
 	serverStore := newSyncStore(t)
 	ts := startServer(t, serverStore)
 
@@ -134,13 +138,13 @@ func TestClient_Broadcast(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Client A writes — should push to server, server broadcasts to B, B pulls.
-	if err := storeA.SetItem("app", "broadcast-key", "from-a"); err != nil {
+	if err := storeA.SetItem(ctx, "app", "broadcast-key", "from-a"); err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
-	val, err := storeB.Get("broadcast-key")
+	val, err := storeB.Get(ctx, "broadcast-key")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -150,13 +154,14 @@ func TestClient_Broadcast(t *testing.T) {
 }
 
 func TestClient_MultipleConnections(t *testing.T) {
+	ctx := context.Background()
 	serverStore1 := newSyncStore(t)
 	serverStore2 := newSyncStore(t)
 
-	if err := serverStore1.SetItem("app", "s1-key", "s1-val"); err != nil {
+	if err := serverStore1.SetItem(ctx, "app", "s1-key", "s1-val"); err != nil {
 		t.Fatal(err)
 	}
-	if err := serverStore2.SetItem("app", "s2-key", "s2-val"); err != nil {
+	if err := serverStore2.SetItem(ctx, "app", "s2-key", "s2-val"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,7 +181,7 @@ func TestClient_MultipleConnections(t *testing.T) {
 
 	time.Sleep(300 * time.Millisecond)
 
-	v1, err := clientStore.Get("s1-key")
+	v1, err := clientStore.Get(ctx, "s1-key")
 	if err != nil {
 		t.Fatalf("Get s1-key: %v", err)
 	}
@@ -184,7 +189,7 @@ func TestClient_MultipleConnections(t *testing.T) {
 		t.Fatalf("expected s1-val, got %q", v1)
 	}
 
-	v2, err := clientStore.Get("s2-key")
+	v2, err := clientStore.Get(ctx, "s2-key")
 	if err != nil {
 		t.Fatalf("Get s2-key: %v", err)
 	}
