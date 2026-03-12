@@ -54,7 +54,7 @@ func TestClient_PullFromServer(t *testing.T) {
 	ts := startServer(t, serverStore)
 
 	clientStore := newSyncStore(t)
-	c := client.New(clientStore, client.WithInterval(50*time.Millisecond))
+	c := client.New(clientStore)
 	defer c.Close()
 
 	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
@@ -85,7 +85,7 @@ func TestClient_PushToServer(t *testing.T) {
 	ts := startServer(t, serverStore)
 
 	clientStore := newSyncStore(t)
-	c := client.New(clientStore, client.WithInterval(10*time.Second))
+	c := client.New(clientStore)
 	defer c.Close()
 
 	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
@@ -117,7 +117,7 @@ func TestClient_Broadcast(t *testing.T) {
 
 	// Client A
 	storeA := newSyncStore(t)
-	cA := client.New(storeA, client.WithInterval(10*time.Second))
+	cA := client.New(storeA)
 	defer cA.Close()
 	if err := cA.Connect("peer-a", wsURL(ts), authHeader("token-a")); err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestClient_Broadcast(t *testing.T) {
 
 	// Client B
 	storeB := newSyncStore(t)
-	cB := client.New(storeB, client.WithInterval(10*time.Second))
+	cB := client.New(storeB)
 	defer cB.Close()
 	if err := cB.Connect("peer-b", wsURL(ts), authHeader("token-b")); err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestClient_MultipleConnections(t *testing.T) {
 	ts2 := startServer(t, serverStore2)
 
 	clientStore := newSyncStore(t)
-	c := client.New(clientStore, client.WithInterval(50*time.Millisecond))
+	c := client.New(clientStore)
 	defer c.Close()
 
 	if err := c.Connect("peer-for-s1", wsURL(ts1), authHeader("test-token")); err != nil {
@@ -198,7 +198,7 @@ func TestClient_Close(t *testing.T) {
 	ts := startServer(t, serverStore)
 
 	clientStore := newSyncStore(t)
-	c := client.New(clientStore, client.WithInterval(50*time.Millisecond))
+	c := client.New(clientStore)
 
 	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
 		t.Fatal(err)

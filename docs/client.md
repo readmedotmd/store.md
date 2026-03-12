@@ -25,7 +25,6 @@ Two implementations are provided:
 ```go
 import (
     "net/http"
-    "time"
 
     "github.com/readmedotmd/store.md/backend/bbolt"
     "github.com/readmedotmd/store.md/sync/client"
@@ -37,7 +36,7 @@ defer store.Close()
 ss := core.New(store)
 defer ss.Close()
 
-c := client.New(ss, client.WithInterval(5*time.Second))
+c := client.New(ss)
 defer c.Close()
 
 header := http.Header{}
@@ -56,8 +55,7 @@ The adapter supports two types of connections:
 Created via `Connect` or by calling `Dial` + `AddConnection` with the active flag. Active connections:
 
 - Initiate a sync exchange on connect
-- Run a periodic sync loop (configurable interval)
-- Automatically push local changes via `OnUpdate`
+- Automatically push local changes to all peers via `OnUpdate`
 
 ```go
 // Dial + connect in one call
@@ -68,9 +66,9 @@ c.Connect("peer-id", "ws://server:8080", header)
 
 Created via `AddConnection`. Passive connections:
 
-- Only respond to incoming `sync` messages
-- Do **not** initiate sync or push local changes automatically
-- Broadcast `sync_update` notifications to other connections when new data arrives
+- Initiate a sync exchange on connect to pull any existing data
+- Receive pushed items from the remote peer
+- Push items to the remote peer when local data changes
 
 ```go
 // Used by the server package internally
@@ -94,25 +92,17 @@ c.Connect("peer-a", "ws://server-a:8080", headerA)
 c.Connect("peer-b", "ws://server-b:8080", headerB)
 ```
 
-Data written locally is synced to all active connections. Data received from one connection is broadcast (via `sync_update`) to all other connections.
+Data written locally is pushed to all connections. Data received from one connection is pushed to all other connections.
 
 ## Protocol
 
-The adapter uses two message types:
+The adapter uses a single message type:
 
 | Message | Direction | Behavior |
 |---------|-----------|----------|
-| `sync` | Both | Carries a `SyncPayload`. Calls `store.Sync(peerID, payload)` and sends the response if non-nil. |
-| `sync_update` | Both | Notification that the peer has new data. Triggers a sync exchange on the receiving side. |
+| `sync` | Both | Carries a `SyncPayload` with items the peer hasn't seen. Calls `store.Sync(peerID, payload)` and sends the response if non-nil. |
 
-On local update (`OnUpdate`), the adapter initiates sync on all active connections and broadcasts `sync_update` to all passive connections.
-
-## Options
-
-```go
-// Set the sync interval (default: 5 seconds)
-client.WithInterval(10 * time.Second)
-```
+Sync is entirely event-driven — there is no polling. When local data changes (`OnUpdate`), the adapter immediately pushes the new items to all connected peers by calling `initiateSync` on each connection. When items arrive from a peer, they are applied locally and then pushed to all other connections.
 
 ### Structured Logging
 

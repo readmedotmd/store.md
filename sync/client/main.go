@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	gosync "sync"
-	"time"
 
 	storesync "github.com/readmedotmd/store.md/sync/core"
 )
@@ -39,13 +38,15 @@ type managedConn struct {
 // remote peers via Connections. It uses the store's Sync method to drive
 // the sync protocol.
 //
+// When local data changes, the client pushes items directly to all connected
+// peers. There is no polling — sync is entirely event-driven.
+//
 // Protocol messages:
-//   - sync: carries a SyncPayload
-//   - sync_update: notification that the peer has new data
+//   - sync: carries a SyncPayload with items the peer hasn't seen
 type Client struct {
-	store    storesync.SyncStore
-	interval time.Duration
-	logger   *slog.Logger
+	store  storesync.SyncStore
+	logger *slog.Logger
+
 	maxConns int
 
 	connsMu gosync.RWMutex
@@ -57,7 +58,7 @@ type Client struct {
 	syncInIDs gosync.Map
 
 	// notifyCh coalesces rapid OnUpdate notifications into a single
-	// syncActive + broadcast cycle, avoiding 2 goroutines per update.
+	// push cycle, avoiding 2 goroutines per update.
 	notifyCh chan struct{}
 
 	wg     gosync.WaitGroup // tracks all background goroutines
@@ -69,11 +70,6 @@ type Client struct {
 
 // Option configures a Client.
 type Option func(*Client)
-
-// WithInterval sets the sync polling interval. Default is 5 seconds.
-func WithInterval(d time.Duration) Option {
-	return func(c *Client) { c.interval = d }
-}
 
 // WithLogger sets the structured logger for the client.
 func WithLogger(l *slog.Logger) Option {
@@ -89,7 +85,6 @@ func WithMaxConns(n int) Option {
 func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
 		store:    store,
-		interval: 5 * time.Second,
 		logger:   slog.Default(),
 		maxConns: 100,
 		done:     make(chan struct{}),
@@ -123,7 +118,7 @@ func New(store storesync.SyncStore, opts ...Option) *Client {
 }
 
 // notifyLoop reads from the notify channel and coalesces rapid notifications
-// into a single syncActive + broadcast cycle.
+// into a single push cycle that sends items to all connected peers.
 func (c *Client) notifyLoop() {
 	for {
 		select {
@@ -139,8 +134,7 @@ func (c *Client) notifyLoop() {
 					draining = false
 				}
 			}
-			c.syncActive()
-			c.broadcast(nil)
+			c.pushToAll(nil)
 		}
 	}
 }
@@ -190,14 +184,9 @@ func (c *Client) addConn(conn Connection, active bool) error {
 	c.wg.Add(1)
 	go func() { defer c.wg.Done(); c.readLoop(mc) }()
 
-	if active {
-		c.wg.Add(1)
-		go func() { defer c.wg.Done(); c.syncLoop(mc) }()
-
-		// Initiate first sync immediately.
-		c.wg.Add(1)
-		go func() { defer c.wg.Done(); c.initiateSync(mc) }()
-	}
+	// Initiate first sync immediately to exchange any existing data.
+	c.wg.Add(1)
+	go func() { defer c.wg.Done(); c.initiateSync(mc) }()
 
 	return nil
 }
@@ -232,7 +221,7 @@ func (c *Client) Closed() bool {
 	return c.closed
 }
 
-// Close stops all sync loops and closes all connections.
+// Close stops all goroutines and closes all connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -287,24 +276,10 @@ func (c *Client) initiateSync(mc *managedConn) {
 	}
 }
 
-// syncActive initiates sync on all active connections.
-func (c *Client) syncActive() {
-	c.connsMu.RLock()
-	conns := make([]*managedConn, 0, len(c.conns))
-	for _, mc := range c.conns {
-		if mc.active {
-			conns = append(conns, mc)
-		}
-	}
-	c.connsMu.RUnlock()
-
-	for _, mc := range conns {
-		c.initiateSync(mc)
-	}
-}
-
-// broadcast sends a sync_update notification to all connections except the sender.
-func (c *Client) broadcast(sender *managedConn) {
+// pushToAll pushes items to all connections except the sender by calling
+// initiateSync on each. This sends the actual items each peer hasn't seen,
+// rather than just a notification.
+func (c *Client) pushToAll(sender *managedConn) {
 	c.connsMu.RLock()
 	conns := make([]*managedConn, 0, len(c.conns))
 	for _, mc := range c.conns {
@@ -314,14 +289,8 @@ func (c *Client) broadcast(sender *managedConn) {
 	}
 	c.connsMu.RUnlock()
 
-	msg := Message{Type: "sync_update"}
 	for _, mc := range conns {
-		mc.mu.Lock()
-		err := mc.WriteMessage(msg)
-		mc.mu.Unlock()
-		if err != nil {
-			c.logger.Error("broadcast error", "err", err)
-		}
+		c.initiateSync(mc)
 	}
 }
 
@@ -373,10 +342,10 @@ func (c *Client) readLoop(mc *managedConn) {
 				continue
 			}
 
-			// Notify other connections that new data arrived.
+			// Push items to other connections that new data arrived.
 			if len(msg.Payload.Items) > 0 {
 				c.wg.Add(1)
-				go func() { defer c.wg.Done(); c.broadcast(mc) }()
+				go func() { defer c.wg.Done(); c.pushToAll(mc) }()
 			}
 
 			// Send response if there's data to exchange.
@@ -390,29 +359,13 @@ func (c *Client) readLoop(mc *managedConn) {
 			}
 
 		case "sync_update":
-			// Remote peer has new data — initiate sync.
+			// Backward compatibility: older peers may still send sync_update
+			// notifications. Respond by initiating a sync to push our items.
 			c.wg.Add(1)
 			go func() { defer c.wg.Done(); c.initiateSync(mc) }()
 
 		case "error":
 			c.logger.Error("remote error", "msg", msg.Error)
-		}
-	}
-}
-
-// syncLoop periodically initiates sync on active connections.
-func (c *Client) syncLoop(mc *managedConn) {
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-mc.done:
-			return
-		case <-c.done:
-			return
-		case <-ticker.C:
-			c.initiateSync(mc)
 		}
 	}
 }
