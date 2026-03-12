@@ -1,12 +1,16 @@
 package integration_test
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	storemd "github.com/readmedotmd/store.md"
 	"github.com/readmedotmd/store.md/backend/memory"
 	"github.com/readmedotmd/store.md/sync/client"
 	storesync "github.com/readmedotmd/store.md/sync/core"
@@ -30,14 +34,21 @@ var factories = []Factory{
 	{
 		Name: "StoreSync",
 		NewStore: func(t *testing.T) storesync.SyncStore {
-			return storesync.New(memory.New(), int64(100*time.Millisecond))
+			s := storesync.New(memory.New(), int64(100*time.Millisecond))
+			t.Cleanup(func() { s.Close() })
+			return s
 		},
 	},
 	{
 		Name: "StoreMessage",
 		NewStore: func(t *testing.T) storesync.SyncStore {
 			ss := storesync.New(memory.New(), int64(100*time.Millisecond))
-			return message.New(ss, fmt.Sprintf("msg-%d", time.Now().UnixNano()))
+			m := message.New(ss, fmt.Sprintf("msg-%d", time.Now().UnixNano()))
+			t.Cleanup(func() {
+				m.Close()
+				ss.Close()
+			})
+			return m
 		},
 	},
 }
@@ -93,13 +104,14 @@ func pollFor(t *testing.T, timeout time.Duration, desc string, fn func() bool) {
 // --- Tests ---
 
 func TestFullRoundTrip(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
-			if err := serverStore.SetItem("app", "key1", "val1"); err != nil {
+			if err := serverStore.SetItem(ctx, "app", "key1", "val1"); err != nil {
 				t.Fatal(err)
 			}
-			if err := serverStore.SetItem("app", "key2", "val2"); err != nil {
+			if err := serverStore.SetItem(ctx, "app", "key2", "val2"); err != nil {
 				t.Fatal(err)
 			}
 
@@ -115,21 +127,21 @@ func TestFullRoundTrip(t *testing.T) {
 
 			// Client pulls server's data.
 			pollFor(t, 3*time.Second, "client gets key1", func() bool {
-				v, err := clientStore.Get("key1")
+				v, err := clientStore.Get(ctx, "key1")
 				return err == nil && v == "val1"
 			})
 			pollFor(t, 3*time.Second, "client gets key2", func() bool {
-				v, err := clientStore.Get("key2")
+				v, err := clientStore.Get(ctx, "key2")
 				return err == nil && v == "val2"
 			})
 
 			// Client writes, pushes to server.
-			if err := clientStore.SetItem("app", "client-key", "client-val"); err != nil {
+			if err := clientStore.SetItem(ctx, "app", "client-key", "client-val"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 3*time.Second, "server gets client-key", func() bool {
-				v, err := serverStore.Get("client-key")
+				v, err := serverStore.Get(ctx, "client-key")
 				return err == nil && v == "client-val"
 			})
 		})
@@ -137,6 +149,7 @@ func TestFullRoundTrip(t *testing.T) {
 }
 
 func TestTwoClientBroadcast(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
@@ -156,19 +169,19 @@ func TestTwoClientBroadcast(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 
-			if err := storeA.SetItem("app", "from-a", "hello"); err != nil {
+			if err := storeA.SetItem(ctx, "app", "from-a", "hello"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 3*time.Second, "server gets from-a", func() bool {
-				v, err := serverStore.Get("from-a")
+				v, err := serverStore.Get(ctx, "from-a")
 				return err == nil && v == "hello"
 			})
 
 			pollFor(t, 3*time.Second, "client-b gets from-a", func() bool {
-				v, err := storeB.Get("from-a")
+				v, err := storeB.Get(ctx, "from-a")
 				return err == nil && v == "hello"
 			})
 		})
@@ -176,13 +189,14 @@ func TestTwoClientBroadcast(t *testing.T) {
 }
 
 func TestConflictResolution(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
 			ts := startServer(t, serverStore)
 
 			// Server writes first (older timestamp).
-			serverStore.SetItem("app", "conflict", "server-val")
+			serverStore.SetItem(ctx, "app", "conflict", "server-val")
 			time.Sleep(5 * time.Millisecond)
 
 			clientStore := f.NewStore(t)
@@ -194,15 +208,15 @@ func TestConflictResolution(t *testing.T) {
 			}
 
 			pollFor(t, 3*time.Second, "client gets server-val", func() bool {
-				v, err := clientStore.Get("conflict")
+				v, err := clientStore.Get(ctx, "conflict")
 				return err == nil && v == "server-val"
 			})
 
 			// Client writes newer value.
-			clientStore.SetItem("app", "conflict", "client-wins")
+			clientStore.SetItem(ctx, "app", "conflict", "client-wins")
 
 			pollFor(t, 3*time.Second, "server accepts client-wins", func() bool {
-				v, err := serverStore.Get("conflict")
+				v, err := serverStore.Get(ctx, "conflict")
 				return err == nil && v == "client-wins"
 			})
 		})
@@ -210,10 +224,11 @@ func TestConflictResolution(t *testing.T) {
 }
 
 func TestDeleteSync(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
-			serverStore.SetItem("app", "to-delete", "exists")
+			serverStore.SetItem(ctx, "app", "to-delete", "exists")
 
 			ts := startServer(t, serverStore)
 
@@ -226,28 +241,29 @@ func TestDeleteSync(t *testing.T) {
 			}
 
 			pollFor(t, 3*time.Second, "client gets to-delete", func() bool {
-				v, err := clientStore.Get("to-delete")
+				v, err := clientStore.Get(ctx, "to-delete")
 				return err == nil && v == "exists"
 			})
 
-			if err := clientStore.Delete("to-delete"); err != nil {
+			if err := clientStore.Delete(ctx, "to-delete"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 3*time.Second, "server sees delete", func() bool {
-				_, err := serverStore.Get("to-delete")
-				return err != nil
+				_, err := serverStore.Get(ctx, "to-delete")
+				return errors.Is(err, storemd.ErrNotFound)
 			})
 		})
 	}
 }
 
 func TestManyItems(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
 			for i := range 50 {
-				if err := serverStore.SetItem("app", fmt.Sprintf("item-%03d", i), fmt.Sprintf("value-%d", i)); err != nil {
+				if err := serverStore.SetItem(ctx, "app", fmt.Sprintf("item-%03d", i), fmt.Sprintf("value-%d", i)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -264,7 +280,7 @@ func TestManyItems(t *testing.T) {
 
 			pollFor(t, 5*time.Second, "client gets all 50 items", func() bool {
 				for i := range 50 {
-					v, err := clientStore.Get(fmt.Sprintf("item-%03d", i))
+					v, err := clientStore.Get(ctx, fmt.Sprintf("item-%03d", i))
 					if err != nil || v != fmt.Sprintf("value-%d", i) {
 						return false
 					}
@@ -276,6 +292,7 @@ func TestManyItems(t *testing.T) {
 }
 
 func TestBidirectionalSimultaneous(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore := f.NewStore(t)
@@ -289,22 +306,22 @@ func TestBidirectionalSimultaneous(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 
 			for i := range 10 {
-				serverStore.SetItem("app", fmt.Sprintf("srv-%d", i), fmt.Sprintf("srv-val-%d", i))
+				serverStore.SetItem(ctx, "app", fmt.Sprintf("srv-%d", i), fmt.Sprintf("srv-val-%d", i))
 			}
 			for i := range 10 {
-				clientStore.SetItem("app", fmt.Sprintf("cli-%d", i), fmt.Sprintf("cli-val-%d", i))
+				clientStore.SetItem(ctx, "app", fmt.Sprintf("cli-%d", i), fmt.Sprintf("cli-val-%d", i))
 			}
 
 			pollFor(t, 5*time.Second, "both stores converge", func() bool {
 				for i := range 10 {
-					v, err := clientStore.Get(fmt.Sprintf("srv-%d", i))
+					v, err := clientStore.Get(ctx, fmt.Sprintf("srv-%d", i))
 					if err != nil || v != fmt.Sprintf("srv-val-%d", i) {
 						return false
 					}
-					v, err = serverStore.Get(fmt.Sprintf("cli-%d", i))
+					v, err = serverStore.Get(ctx, fmt.Sprintf("cli-%d", i))
 					if err != nil || v != fmt.Sprintf("cli-val-%d", i) {
 						return false
 					}
@@ -318,6 +335,7 @@ func TestBidirectionalSimultaneous(t *testing.T) {
 // TestTriangleSync sets up A → B → C → A: three servers, each with a client
 // connecting to the next in a ring. A write on any node should propagate to all.
 func TestTriangleSync(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			// Create three stores + servers.
@@ -349,54 +367,54 @@ func TestTriangleSync(t *testing.T) {
 			}
 
 			// Let initial sync settle.
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 
 			// A writes — should propagate A→B→C→A (full ring).
-			if err := storeA.SetItem("app", "from-a", "a-val"); err != nil {
+			if err := storeA.SetItem(ctx, "app", "from-a", "a-val"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 5*time.Second, "B gets from-a", func() bool {
-				v, err := storeB.Get("from-a")
+				v, err := storeB.Get(ctx, "from-a")
 				return err == nil && v == "a-val"
 			})
 			pollFor(t, 5*time.Second, "C gets from-a", func() bool {
-				v, err := storeC.Get("from-a")
+				v, err := storeC.Get(ctx, "from-a")
 				return err == nil && v == "a-val"
 			})
 
 			// B writes — should reach C and A.
-			if err := storeB.SetItem("app", "from-b", "b-val"); err != nil {
+			if err := storeB.SetItem(ctx, "app", "from-b", "b-val"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 5*time.Second, "C gets from-b", func() bool {
-				v, err := storeC.Get("from-b")
+				v, err := storeC.Get(ctx, "from-b")
 				return err == nil && v == "b-val"
 			})
 			pollFor(t, 5*time.Second, "A gets from-b", func() bool {
-				v, err := storeA.Get("from-b")
+				v, err := storeA.Get(ctx, "from-b")
 				return err == nil && v == "b-val"
 			})
 
 			// C writes — should reach A and B.
-			if err := storeC.SetItem("app", "from-c", "c-val"); err != nil {
+			if err := storeC.SetItem(ctx, "app", "from-c", "c-val"); err != nil {
 				t.Fatal(err)
 			}
 
 			pollFor(t, 5*time.Second, "A gets from-c", func() bool {
-				v, err := storeA.Get("from-c")
+				v, err := storeA.Get(ctx, "from-c")
 				return err == nil && v == "c-val"
 			})
 			pollFor(t, 5*time.Second, "B gets from-c", func() bool {
-				v, err := storeB.Get("from-c")
+				v, err := storeB.Get(ctx, "from-c")
 				return err == nil && v == "c-val"
 			})
 
 			// Verify all three stores have all three keys.
 			for name, store := range map[string]storesync.SyncStore{"A": storeA, "B": storeB, "C": storeC} {
 				for _, key := range []string{"from-a", "from-b", "from-c"} {
-					v, err := store.Get(key)
+					v, err := store.Get(ctx, key)
 					if err != nil {
 						t.Fatalf("%s missing %s: %v", name, key, err)
 					}
@@ -411,13 +429,14 @@ func TestTriangleSync(t *testing.T) {
 }
 
 func TestMultipleConnections(t *testing.T) {
+	ctx := context.Background()
 	for _, f := range factories {
 		t.Run(f.Name, func(t *testing.T) {
 			serverStore1 := f.NewStore(t)
 			serverStore2 := f.NewStore(t)
 
-			serverStore1.SetItem("app", "s1-key", "s1-val")
-			serverStore2.SetItem("app", "s2-key", "s2-val")
+			serverStore1.SetItem(ctx, "app", "s1-key", "s1-val")
+			serverStore2.SetItem(ctx, "app", "s2-key", "s2-val")
 
 			ts1 := startServer(t, serverStore1)
 			ts2 := startServer(t, serverStore2)
@@ -434,12 +453,192 @@ func TestMultipleConnections(t *testing.T) {
 			}
 
 			pollFor(t, 3*time.Second, "client gets s1-key", func() bool {
-				v, err := clientStore.Get("s1-key")
+				v, err := clientStore.Get(ctx, "s1-key")
 				return err == nil && v == "s1-val"
 			})
 			pollFor(t, 3*time.Second, "client gets s2-key", func() bool {
-				v, err := clientStore.Get("s2-key")
+				v, err := clientStore.Get(ctx, "s2-key")
 				return err == nil && v == "s2-val"
+			})
+		})
+	}
+}
+
+// --- New Tests ---
+
+func TestConcurrentWrites(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range factories {
+		t.Run(f.Name, func(t *testing.T) {
+			serverStore := f.NewStore(t)
+			ts := startServer(t, serverStore)
+
+			clientStore := f.NewStore(t)
+			c := newClient(clientStore, 50*time.Millisecond)
+			defer c.Close()
+
+			if err := c.Connect("server-peer", wsURL(ts), header("token-a")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait for connection to establish.
+			time.Sleep(50 * time.Millisecond)
+
+			// Multiple goroutines writing to the server store simultaneously.
+			const numWriters = 10
+			const writesPerWriter = 5
+			var wg sync.WaitGroup
+			wg.Add(numWriters)
+			for w := range numWriters {
+				go func(writer int) {
+					defer wg.Done()
+					for i := range writesPerWriter {
+						key := fmt.Sprintf("w%d-k%d", writer, i)
+						val := fmt.Sprintf("v%d-%d", writer, i)
+						if err := serverStore.SetItem(ctx, "app", key, val); err != nil {
+							t.Errorf("writer %d failed on key %d: %v", writer, i, err)
+						}
+					}
+				}(w)
+			}
+			wg.Wait()
+
+			// Verify all writes are visible on the server.
+			for w := range numWriters {
+				for i := range writesPerWriter {
+					key := fmt.Sprintf("w%d-k%d", w, i)
+					expected := fmt.Sprintf("v%d-%d", w, i)
+					v, err := serverStore.Get(ctx, key)
+					if err != nil {
+						t.Fatalf("server missing %s: %v", key, err)
+					}
+					if v != expected {
+						t.Fatalf("server has %s=%q, want %q", key, v, expected)
+					}
+				}
+			}
+
+			// Verify all writes sync to client.
+			totalKeys := numWriters * writesPerWriter
+			pollFor(t, 10*time.Second, fmt.Sprintf("client gets all %d keys", totalKeys), func() bool {
+				for w := range numWriters {
+					for i := range writesPerWriter {
+						key := fmt.Sprintf("w%d-k%d", w, i)
+						expected := fmt.Sprintf("v%d-%d", w, i)
+						v, err := clientStore.Get(ctx, key)
+						if err != nil || v != expected {
+							return false
+						}
+					}
+				}
+				return true
+			})
+		})
+	}
+}
+
+func TestLargePayloadSync(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range factories {
+		t.Run(f.Name, func(t *testing.T) {
+			serverStore := f.NewStore(t)
+
+			const numItems = 200
+			for i := range numItems {
+				key := fmt.Sprintf("large-%04d", i)
+				val := fmt.Sprintf("payload-%d", i)
+				if err := serverStore.SetItem(ctx, "app", key, val); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			ts := startServer(t, serverStore)
+
+			clientStore := f.NewStore(t)
+			c := newClient(clientStore, 50*time.Millisecond)
+			defer c.Close()
+
+			if err := c.Connect("server-peer", wsURL(ts), header("token-a")); err != nil {
+				t.Fatal(err)
+			}
+
+			pollFor(t, 15*time.Second, fmt.Sprintf("client gets all %d items", numItems), func() bool {
+				for i := range numItems {
+					key := fmt.Sprintf("large-%04d", i)
+					expected := fmt.Sprintf("payload-%d", i)
+					v, err := clientStore.Get(ctx, key)
+					if err != nil || v != expected {
+						return false
+					}
+				}
+				return true
+			})
+		})
+	}
+}
+
+func TestReconnect(t *testing.T) {
+	ctx := context.Background()
+	for _, f := range factories {
+		t.Run(f.Name, func(t *testing.T) {
+			serverStore := f.NewStore(t)
+
+			// Seed server with initial data.
+			if err := serverStore.SetItem(ctx, "app", "before-disconnect", "initial"); err != nil {
+				t.Fatal(err)
+			}
+
+			ts := startServer(t, serverStore)
+
+			clientStore := f.NewStore(t)
+			c1 := newClient(clientStore, 50*time.Millisecond)
+
+			if err := c1.Connect("server-peer", wsURL(ts), header("token-a")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Wait for initial sync.
+			pollFor(t, 3*time.Second, "client gets before-disconnect", func() bool {
+				v, err := clientStore.Get(ctx, "before-disconnect")
+				return err == nil && v == "initial"
+			})
+
+			// Client writes data before disconnecting.
+			if err := clientStore.SetItem(ctx, "app", "client-before", "from-client"); err != nil {
+				t.Fatal(err)
+			}
+
+			pollFor(t, 3*time.Second, "server gets client-before", func() bool {
+				v, err := serverStore.Get(ctx, "client-before")
+				return err == nil && v == "from-client"
+			})
+
+			// Disconnect.
+			c1.Close()
+
+			// Server writes while client is disconnected.
+			if err := serverStore.SetItem(ctx, "app", "during-disconnect", "missed"); err != nil {
+				t.Fatal(err)
+			}
+
+			// Reconnect with a new client using the same store.
+			c2 := newClient(clientStore, 50*time.Millisecond)
+			defer c2.Close()
+
+			if err := c2.Connect("server-peer", wsURL(ts), header("token-a")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify client picks up data written during disconnect.
+			pollFor(t, 3*time.Second, "client gets during-disconnect", func() bool {
+				v, err := clientStore.Get(ctx, "during-disconnect")
+				return err == nil && v == "missed"
+			})
+
+			// Verify old data is still present.
+			pollFor(t, 3*time.Second, "client still has before-disconnect", func() bool {
+				v, err := clientStore.Get(ctx, "before-disconnect")
+				return err == nil && v == "initial"
 			})
 		})
 	}
