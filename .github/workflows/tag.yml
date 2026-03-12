@@ -1,0 +1,39 @@
+name: Tag
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Auto Tag
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate prerelease tag
+        run: |
+          BASE=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo '')
+          if [ -z "$BASE" ]; then
+            BASE='v0.0.0'
+          fi
+
+          # Find the highest existing prerelease number for this base version
+          LAST=$(git tag --sort=-v:refname | grep -E "^${BASE}-[0-9]+$" | head -n1 || echo '')
+          if [ -z "$LAST" ]; then
+            NEXT=0
+          else
+            NUM=${LAST##*-}
+            NEXT=$((NUM + 1))
+          fi
+
+          TAG="${BASE}-${NEXT}"
+          echo "Tagging $TAG"
+          git tag "$TAG"
+          git push origin "$TAG"

@@ -36,8 +36,11 @@ jobs:
           curl -sfG "$GENERATE_URL" \
             --data-urlencode "api_key=$API_KEY" \
             --data-urlencode "name=$REPO_NAME" \
+            --data-urlencode "title=KEY-VALUE STORE WITH SYNC ENGINE FOR GO" \
             --data-urlencode "tagline=$REPO_DESC" \
+            --data-urlencode "description=One interface. Seven backends. Built-in P2P sync." \
             --data-urlencode "version=$VERSION" \
+            --data-urlencode "tags=BBolt,Badger,SQL,S3,MongoDB,Redis,IndexedDB,MIT" \
             -o .github/banner.svg
 
       - name: Commit banner
