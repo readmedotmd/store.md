@@ -24,16 +24,16 @@ jobs:
             BASE='v0.0.0'
           fi
 
-          # Find the highest existing prerelease number for this base version
-          LAST=$(git tag --sort=-v:refname | grep -E "^${BASE}-[0-9]+$" | head -n1 || echo '')
+          # Find the highest existing alpha number for this base version
+          LAST=$(git tag --sort=-v:refname | grep -E "^${BASE}-alpha\.[0-9]+$" | head -n1 || echo '')
           if [ -z "$LAST" ]; then
             NEXT=0
           else
-            NUM=${LAST##*-}
+            NUM=${LAST##*.}
             NEXT=$((NUM + 1))
           fi
 
-          TAG="${BASE}-${NEXT}"
+          TAG="${BASE}-alpha.${NEXT}"
           echo "Tagging $TAG"
           git tag "$TAG"
           git push origin "$TAG"
