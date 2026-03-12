@@ -697,6 +697,7 @@ func TestNetworkEfficiency_WriteAfterSync(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 
 			sent := rec.Sent()
+			recv := rec.Recv()
 			if len(sent) == 0 {
 				t.Error("expected at least one sent message after client write")
 			}
@@ -706,13 +707,28 @@ func TestNetworkEfficiency_WriteAfterSync(t *testing.T) {
 					t.Errorf("sent message %d is an empty sync payload (no items)", i)
 				}
 			}
+			// Every received sync message must carry items (no empty payloads).
+			for i, msg := range recv {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("recv message %d is an empty sync payload (no items)", i)
+				}
+			}
 			// The new item must appear in sent messages.
 			sentKeys := uniqueItemKeys(sent)
 			if !sentKeys["client-write"] {
 				t.Error("client-write not found in sent messages")
 			}
-			t.Logf("client write phase: %d sent, %d recv, sent keys: %v",
-				len(sent), len(rec.Recv()), sentKeys)
+			// Only the new item should appear — no previously-synced keys.
+			if sentKeys["initial"] {
+				t.Error("sent messages contain 'initial' key — should not re-send already-synced items")
+			}
+			// Received messages should not echo back pre-existing items.
+			recvKeys := uniqueItemKeys(recv)
+			if recvKeys["initial"] {
+				t.Error("recv messages contain 'initial' key — server should not echo back already-synced items")
+			}
+			t.Logf("client write phase: %d sent, %d recv, sent keys: %v, recv keys: %v",
+				len(sent), len(recv), sentKeys, recvKeys)
 
 			// --- Phase 2: Server writes a new item ---
 			rec.resetRecording()
@@ -727,17 +743,43 @@ func TestNetworkEfficiency_WriteAfterSync(t *testing.T) {
 			})
 			time.Sleep(300 * time.Millisecond)
 
-			recv := rec.Recv()
-			if len(recv) == 0 {
+			sent2 := rec.Sent()
+			recv2 := rec.Recv()
+			if len(recv2) == 0 {
 				t.Error("expected at least one received message after server write")
 			}
+			// Every received sync message must carry items (no empty payloads).
+			for i, msg := range recv2 {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("recv message %d is an empty sync payload (no items)", i)
+				}
+			}
+			// Every sent sync message must carry items (no empty payloads).
+			for i, msg := range sent2 {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("sent message %d is an empty sync payload (no items)", i)
+				}
+			}
 			// The received messages should contain the server-write item.
-			recvKeys := uniqueItemKeys(recv)
-			if !recvKeys["server-write"] {
+			recv2Keys := uniqueItemKeys(recv2)
+			if !recv2Keys["server-write"] {
 				t.Error("server-write not found in received messages")
 			}
-			t.Logf("server write phase: %d sent, %d recv, recv keys: %v",
-				len(rec.Sent()), len(recv), recvKeys)
+			// Received messages should not contain previously-synced items.
+			for _, old := range []string{"initial", "client-write"} {
+				if recv2Keys[old] {
+					t.Errorf("recv messages contain %q key — should not re-send already-synced items", old)
+				}
+			}
+			// Sent messages (responses) should not re-send previously-synced items.
+			sent2Keys := uniqueItemKeys(sent2)
+			for _, old := range []string{"initial", "client-write"} {
+				if sent2Keys[old] {
+					t.Errorf("sent messages contain %q key — should not re-send already-synced items", old)
+				}
+			}
+			t.Logf("server write phase: %d sent, %d recv, sent keys: %v, recv keys: %v",
+				len(sent2), len(recv2), sent2Keys, recv2Keys)
 		})
 	}
 }
@@ -802,19 +844,34 @@ func TestNetworkEfficiency_Reconnect(t *testing.T) {
 			})
 			time.Sleep(300 * time.Millisecond)
 
-			// Collect unique item keys received from server.
+			// Collect unique item keys from both directions.
 			recv := rec.Recv()
+			sent := rec.Sent()
 			recvKeys := uniqueItemKeys(recv)
+			sentKeys := uniqueItemKeys(sent)
 
-			t.Logf("reconnect phase: %d messages recv, %d messages sent, unique keys recv: %v",
-				len(recv), len(rec.Sent()), recvKeys)
+			t.Logf("reconnect phase: %d messages recv, %d messages sent, recv keys: %v, sent keys: %v",
+				len(recv), len(sent), recvKeys, sentKeys)
 
-			// The new item must be present.
+			// Every sync message must carry items (no empty payloads).
+			for i, msg := range recv {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("recv message %d is an empty sync payload (no items)", i)
+				}
+			}
+			for i, msg := range sent {
+				if msg.Type == "sync" && (msg.Payload == nil || len(msg.Payload.Items) == 0) {
+					t.Errorf("sent message %d is an empty sync payload (no items)", i)
+				}
+			}
+
+			// The new item must be present in received messages.
 			if !recvKeys["new-after-disconnect"] {
 				t.Error("new-after-disconnect not found in received messages")
 			}
 
-			// Pre-existing items that the client already has should NOT be re-sent.
+			// Pre-existing items that the client already has should NOT be re-sent
+			// by the server.
 			resent := 0
 			for i := range 5 {
 				if recvKeys[fmt.Sprintf("pre-%d", i)] {
@@ -823,6 +880,17 @@ func TestNetworkEfficiency_Reconnect(t *testing.T) {
 			}
 			if resent > 0 {
 				t.Errorf("server re-sent %d of 5 pre-existing items on reconnect (expected 0)", resent)
+			}
+
+			// Client should NOT re-send pre-existing items to the server either.
+			clientResent := 0
+			for i := range 5 {
+				if sentKeys[fmt.Sprintf("pre-%d", i)] {
+					clientResent++
+				}
+			}
+			if clientResent > 0 {
+				t.Errorf("client re-sent %d of 5 pre-existing items on reconnect (expected 0)", clientResent)
 			}
 
 			// Verify all data is present on the client.
