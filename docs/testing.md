@@ -48,7 +48,7 @@ Your implementation must:
 1. Return `storemd.ErrNotFound` from `Get` and `Delete` when the key doesn't exist (checked via `errors.Is`)
 2. Return results from `List` sorted lexicographically by key
 3. Return an empty slice (not nil) from `List` when there are no results
-4. Support `Prefix`, `StartAfter`, and `Limit` in `ListArgs` (Limit is a string, parse to int)
+4. Support `Prefix`, `StartAfter`, and `Limit` in `ListArgs` (Limit is an int, 0 means no limit)
 5. Treat `StartAfter` as exclusive (don't include the exact key)
 
 ## Running Tests

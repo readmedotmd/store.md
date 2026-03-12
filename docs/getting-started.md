@@ -37,7 +37,7 @@ type Store interface {
 type ListArgs struct {
     Prefix     string // filter keys by prefix
     StartAfter string // cursor for pagination (exclusive)
-    Limit      string // max number of results
+    Limit      int    // max number of results (0 means no limit)
 }
 ```
 
@@ -97,11 +97,11 @@ func main() {
     }
 
     // Paginate
-    page1, _ := store.List(ctx, storemd.ListArgs{Limit: "10"})
+    page1, _ := store.List(ctx, storemd.ListArgs{Limit: 10})
     if len(page1) == 10 {
         lastKey := page1[len(page1)-1].Key
         page2, _ := store.List(ctx, storemd.ListArgs{
-            Limit:      "10",
+            Limit:      10,
             StartAfter: lastKey,
         })
         _ = page2

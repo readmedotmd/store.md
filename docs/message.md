@@ -114,7 +114,7 @@ type MessageListener func(msg Envelope)
 ### Close
 
 ```go
-func (m *StoreMessage) Close()
+func (m *StoreMessage) Close() error
 ```
 
 Unsubscribes from the sync store and cancels any pending `Send` calls. Always call `Close()` when the message store is no longer needed to prevent resource leaks.
