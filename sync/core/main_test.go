@@ -41,6 +41,16 @@ func (s *memStore) Set(_ context.Context, key, value string) error {
 	return nil
 }
 
+func (s *memStore) SetIfNotExists(_ context.Context, key, value string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		return false, nil
+	}
+	s.data[key] = value
+	return true, nil
+}
+
 func (s *memStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -904,5 +914,205 @@ func TestDeleteReturnsTombstone(t *testing.T) {
 	err = ss.Delete(ctx, "dkey")
 	if !errors.Is(err, storemd.ErrNotFound) {
 		t.Errorf("expected ErrNotFound on double delete, got: %v", err)
+	}
+}
+
+func TestSetIfNotExists_Basic(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	ok, err := ss.SetIfNotExists(ctx, "newkey", "value1")
+	if err != nil {
+		t.Fatalf("SetIfNotExists failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true for new key")
+	}
+
+	val, err := ss.Get(ctx, "newkey")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if val != "value1" {
+		t.Fatalf("expected %q, got %q", "value1", val)
+	}
+}
+
+func TestSetIfNotExists_Duplicate(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	ok, err := ss.SetIfNotExists(ctx, "dupkey", "first")
+	if err != nil {
+		t.Fatalf("first SetIfNotExists failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true for first call")
+	}
+
+	ok, err = ss.SetIfNotExists(ctx, "dupkey", "second")
+	if err != nil {
+		t.Fatalf("second SetIfNotExists failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected false for duplicate key")
+	}
+
+	val, err := ss.Get(ctx, "dupkey")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if val != "first" {
+		t.Fatalf("expected original value %q, got %q", "first", val)
+	}
+}
+
+func TestSetIfNotExists_Concurrent(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	const n = 10
+	results := make(chan bool, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := ss.SetIfNotExists(ctx, "race-key", fmt.Sprintf("writer-%d", i))
+			if err != nil {
+				t.Errorf("SetIfNotExists from goroutine %d failed: %v", i, err)
+				return
+			}
+			results <- ok
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	wins := 0
+	for ok := range results {
+		if ok {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected exactly 1 winner, got %d", wins)
+	}
+}
+
+func TestSetIfNotExists_DoesNotSyncOnFalse(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Set key via normal SetItem first.
+	if err := ss.SetItem(ctx, "app", "existing", "original"); err != nil {
+		t.Fatal(err)
+	}
+
+	var updates []SyncStoreItem
+	ss.OnUpdate(func(item SyncStoreItem) {
+		updates = append(updates, item)
+	})
+
+	// SetIfNotExists should return false and NOT trigger OnUpdate.
+	ok, err := ss.SetIfNotExists(ctx, "existing", "new-value")
+	if err != nil {
+		t.Fatalf("SetIfNotExists failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected false for existing key")
+	}
+	if len(updates) != 0 {
+		t.Fatalf("expected no updates when SetIfNotExists returns false, got %d", len(updates))
+	}
+
+	// Original value should be unchanged.
+	val, err := ss.Get(ctx, "existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "original" {
+		t.Fatalf("expected %q, got %q", "original", val)
+	}
+}
+
+func TestSetIfNotExists_SyncsToRemote(t *testing.T) {
+	store1 := newTestSyncStore()
+	defer store1.Close()
+	store2 := newTestSyncStore()
+	defer store2.Close()
+	ctx := context.Background()
+
+	// Use SetIfNotExists on store1.
+	ok, err := store1.SetIfNotExists(ctx, "claim-key", "claimed-value")
+	if err != nil {
+		t.Fatalf("SetIfNotExists failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true for new key")
+	}
+
+	// SyncOut from store1 should include the item.
+	payload, err := store1.SyncOut(ctx, "store2", 0)
+	if err != nil {
+		t.Fatalf("SyncOut failed: %v", err)
+	}
+	if len(payload.Items) == 0 {
+		t.Fatal("SyncOut returned no items — SetIfNotExists value not in sync queue")
+	}
+
+	found := false
+	for _, item := range payload.Items {
+		if item.Key == "claim-key" && item.Value == "claimed-value" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("claim-key not found in SyncOut payload")
+	}
+
+	// SyncIn to store2.
+	if err := store2.SyncIn(ctx, "store1", *payload); err != nil {
+		t.Fatalf("SyncIn failed: %v", err)
+	}
+
+	// Verify store2 has the value.
+	val, err := store2.Get(ctx, "claim-key")
+	if err != nil {
+		t.Fatalf("Get from store2 failed: %v", err)
+	}
+	if val != "claimed-value" {
+		t.Fatalf("expected %q, got %q", "claimed-value", val)
+	}
+}
+
+func TestSetIfNotExists_OnUpdateFires(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	var updates []SyncStoreItem
+	ss.OnUpdate(func(item SyncStoreItem) {
+		updates = append(updates, item)
+	})
+
+	ok, err := ss.SetIfNotExists(ctx, "notify-key", "notify-value")
+	if err != nil {
+		t.Fatalf("SetIfNotExists failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true for new key")
+	}
+
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 OnUpdate call, got %d", len(updates))
+	}
+	if updates[0].Key != "notify-key" || updates[0].Value != "notify-value" {
+		t.Fatalf("unexpected update: %+v", updates[0])
 	}
 }

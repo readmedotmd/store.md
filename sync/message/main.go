@@ -101,6 +101,7 @@ func (m *StoreMessage) Close() error {
 
 func (m *StoreMessage) Get(ctx context.Context, key string) (string, error)                              { return m.ss.Get(ctx, key) }
 func (m *StoreMessage) Set(ctx context.Context, key, value string) error                                 { return m.ss.Set(ctx, key, value) }
+func (m *StoreMessage) SetIfNotExists(ctx context.Context, key, value string) (bool, error)              { return m.ss.SetIfNotExists(ctx, key, value) }
 func (m *StoreMessage) Delete(ctx context.Context, key string) error                                     { return m.ss.Delete(ctx, key) }
 func (m *StoreMessage) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error)  { return m.ss.List(ctx, args) }
 

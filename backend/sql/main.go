@@ -49,6 +49,21 @@ func (s *StoreSQL) Set(ctx context.Context, key, value string) error {
 	return err
 }
 
+func (s *StoreSQL) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	result, err := s.db.ExecContext(ctx,
+		"INSERT INTO kv_store (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+		key, value,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func (s *StoreSQL) Delete(ctx context.Context, key string) error {
 	result, err := s.db.ExecContext(ctx, "DELETE FROM kv_store WHERE key = ?", key)
 	if err != nil {

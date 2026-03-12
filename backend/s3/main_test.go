@@ -151,3 +151,12 @@ func TestS3Store(t *testing.T) {
 		return New(minioClient, testBucket, prefix)
 	})
 }
+
+func TestS3Store_SetIfNotExists(t *testing.T) {
+	counter := 0
+	storemd.RunSetIfNotExistsTests(t, func(t *testing.T) storemd.Store {
+		counter++
+		prefix := fmt.Sprintf("test-sine-%d/", counter)
+		return New(minioClient, testBucket, prefix)
+	})
+}

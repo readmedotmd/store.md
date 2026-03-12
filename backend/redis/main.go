@@ -87,6 +87,16 @@ func (s *StoreRedis) Set(ctx context.Context, key, value string) error {
 	return s.client.Set(ctx, s.redisKey(key), value, 0).Err()
 }
 
+func (s *StoreRedis) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	ok, err := s.client.SetNX(ctx, s.redisKey(key), value, 0).Result()
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
 func (s *StoreRedis) Delete(ctx context.Context, key string) error {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

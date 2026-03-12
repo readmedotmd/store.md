@@ -12,3 +12,9 @@ func TestMemoryStore(t *testing.T) {
 		return memory.New()
 	})
 }
+
+func TestMemoryStore_SetIfNotExists(t *testing.T) {
+	storemd.RunSetIfNotExistsTests(t, func(t *testing.T) storemd.Store {
+		return memory.New()
+	})
+}

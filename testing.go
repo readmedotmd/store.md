@@ -85,6 +85,119 @@ func RunClearTests(t *testing.T, factory ClearableFactory) {
 	})
 }
 
+// RunSetIfNotExistsTests runs tests for the SetIfNotExists method.
+func RunSetIfNotExistsTests(t *testing.T, factory StoreFactory) {
+	ctx := context.Background()
+
+	t.Run("SetIfNotExists_Basic", func(t *testing.T) {
+		s := factory(t)
+		ok, err := s.SetIfNotExists(ctx, "newkey", "value1")
+		if err != nil {
+			t.Fatalf("SetIfNotExists failed: %v", err)
+		}
+		if !ok {
+			t.Fatal("expected true for new key, got false")
+		}
+		val, err := s.Get(ctx, "newkey")
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if val != "value1" {
+			t.Fatalf("expected %q, got %q", "value1", val)
+		}
+	})
+
+	t.Run("SetIfNotExists_Duplicate", func(t *testing.T) {
+		s := factory(t)
+		ok, err := s.SetIfNotExists(ctx, "dupkey", "first")
+		if err != nil {
+			t.Fatalf("first SetIfNotExists failed: %v", err)
+		}
+		if !ok {
+			t.Fatal("expected true for first call")
+		}
+
+		ok, err = s.SetIfNotExists(ctx, "dupkey", "second")
+		if err != nil {
+			t.Fatalf("second SetIfNotExists failed: %v", err)
+		}
+		if ok {
+			t.Fatal("expected false for duplicate key, got true")
+		}
+
+		val, err := s.Get(ctx, "dupkey")
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if val != "first" {
+			t.Fatalf("expected original value %q, got %q", "first", val)
+		}
+	})
+
+	t.Run("SetIfNotExists_Concurrent", func(t *testing.T) {
+		s := factory(t)
+		const n = 10
+		results := make(chan bool, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ok, err := s.SetIfNotExists(ctx, "race-key", fmt.Sprintf("writer-%d", i))
+				if err != nil {
+					t.Errorf("SetIfNotExists from goroutine %d failed: %v", i, err)
+					return
+				}
+				results <- ok
+			}(i)
+		}
+		wg.Wait()
+		close(results)
+
+		wins := 0
+		for ok := range results {
+			if ok {
+				wins++
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("expected exactly 1 winner, got %d", wins)
+		}
+
+		// Verify the key is readable.
+		_, err := s.Get(ctx, "race-key")
+		if err != nil {
+			t.Fatalf("Get after concurrent SetIfNotExists failed: %v", err)
+		}
+	})
+
+	t.Run("SetIfNotExists_DifferentKeys", func(t *testing.T) {
+		s := factory(t)
+		for i := range 5 {
+			key := fmt.Sprintf("diffkey-%d", i)
+			ok, err := s.SetIfNotExists(ctx, key, fmt.Sprintf("val-%d", i))
+			if err != nil {
+				t.Fatalf("SetIfNotExists %q failed: %v", key, err)
+			}
+			if !ok {
+				t.Fatalf("expected true for unique key %q", key)
+			}
+		}
+		// Verify all are readable.
+		for i := range 5 {
+			key := fmt.Sprintf("diffkey-%d", i)
+			val, err := s.Get(ctx, key)
+			if err != nil {
+				t.Fatalf("Get %q failed: %v", key, err)
+			}
+			expected := fmt.Sprintf("val-%d", i)
+			if val != expected {
+				t.Fatalf("key %q: expected %q, got %q", key, expected, val)
+			}
+		}
+	})
+}
+
 // RunStoreTests runs the full generic test suite against any Store implementation.
 func RunStoreTests(t *testing.T, factory StoreFactory) {
 	ctx := context.Background()

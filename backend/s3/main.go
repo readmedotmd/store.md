@@ -74,6 +74,96 @@ func (s *StoreS3) Set(ctx context.Context, key, value string) error {
 	return err
 }
 
+// SetIfNotExists writes the key only if it does not already exist.
+// This uses S3 versioning: PutObject unconditionally, then check if our version
+// is the oldest. If not, we lost the race — delete our version and return false.
+// Requires bucket versioning to be enabled.
+func (s *StoreS3) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+
+	fullKey := s.fullKey(key)
+
+	// Put the object unconditionally.
+	info, err := s.client.PutObject(ctx, s.bucket, fullKey, strings.NewReader(value), int64(len(value)), minio.PutObjectOptions{})
+	if err != nil {
+		return false, err
+	}
+	ourVersionID := info.VersionID
+
+	// List versions to see if ours is the oldest (i.e., the winner).
+	won, err := s.isOldestVersion(ctx, fullKey, ourVersionID)
+	if err != nil {
+		return false, err
+	}
+
+	if !won {
+		// We lost the race. Clean up our version.
+		s.client.RemoveObject(ctx, s.bucket, fullKey, minio.RemoveObjectOptions{
+			VersionID: ourVersionID,
+		})
+		return false, nil
+	}
+
+	// Safety net: sleep and re-verify to account for S3 timestamp granularity.
+	time.Sleep(1500 * time.Millisecond)
+
+	won, err = s.isOldestVersion(ctx, fullKey, ourVersionID)
+	if err != nil {
+		return false, err
+	}
+	if !won {
+		s.client.RemoveObject(ctx, s.bucket, fullKey, minio.RemoveObjectOptions{
+			VersionID: ourVersionID,
+		})
+		return false, nil
+	}
+
+	// Clean up any newer versions that lost the race but weren't cleaned up.
+	s.cleanLosingVersions(ctx, fullKey, ourVersionID)
+
+	return true, nil
+}
+
+// isOldestVersion checks whether the given versionID is the oldest version of the object.
+func (s *StoreS3) isOldestVersion(ctx context.Context, key, versionID string) (bool, error) {
+	versions := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix:       key,
+		WithVersions: true,
+	})
+
+	var oldest string
+	for v := range versions {
+		if v.Err != nil {
+			return false, v.Err
+		}
+		if v.Key != key {
+			continue
+		}
+		// ListObjects with versions returns newest first; track last seen as oldest.
+		oldest = v.VersionID
+	}
+	return oldest == versionID, nil
+}
+
+// cleanLosingVersions removes all versions of the key except the winner.
+func (s *StoreS3) cleanLosingVersions(ctx context.Context, key, winnerVersionID string) {
+	versions := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
+		Prefix:       key,
+		WithVersions: true,
+	})
+	for v := range versions {
+		if v.Err != nil || v.Key != key {
+			continue
+		}
+		if v.VersionID != winnerVersionID {
+			s.client.RemoveObject(ctx, s.bucket, key, minio.RemoveObjectOptions{
+				VersionID: v.VersionID,
+			})
+		}
+	}
+}
+
 func (s *StoreS3) Delete(ctx context.Context, key string) error {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

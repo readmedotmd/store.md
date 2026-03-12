@@ -69,6 +69,19 @@ func (s *StoreMongo) Set(ctx context.Context, key, value string) error {
 	return err
 }
 
+func (s *StoreMongo) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	_, err := s.col.InsertOne(ctx, document{ID: key, Value: value})
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *StoreMongo) Delete(ctx context.Context, key string) error {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

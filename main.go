@@ -28,6 +28,9 @@ type ListArgs struct {
 type Store interface {
 	Get(ctx context.Context, key string) (value string, err error)
 	Set(ctx context.Context, key, value string) (err error)
+	// SetIfNotExists writes the key only if it does not already exist.
+	// Returns true if the write succeeded (key was new), false if the key already existed.
+	SetIfNotExists(ctx context.Context, key, value string) (bool, error)
 	Delete(ctx context.Context, key string) (err error)
 	List(ctx context.Context, args ListArgs) (result []KeyValuePair, err error)
 }

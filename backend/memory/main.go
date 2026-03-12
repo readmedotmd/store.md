@@ -39,6 +39,16 @@ func (s *StoreMemory) Set(ctx context.Context, key, value string) error {
 	return nil
 }
 
+func (s *StoreMemory) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		return false, nil
+	}
+	s.data[key] = value
+	return true, nil
+}
+
 func (s *StoreMemory) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

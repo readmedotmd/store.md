@@ -71,6 +71,19 @@ func (s *StoreBBolt) Set(ctx context.Context, key, value string) error {
 	})
 }
 
+func (s *StoreBBolt) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	var created bool
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketName)
+		if v := b.Get([]byte(key)); v != nil {
+			return nil
+		}
+		created = true
+		return b.Put([]byte(key), []byte(value))
+	})
+	return created, err
+}
+
 func (s *StoreBBolt) Delete(ctx context.Context, key string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketName)

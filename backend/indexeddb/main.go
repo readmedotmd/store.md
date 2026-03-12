@@ -83,6 +83,40 @@ func (s *StoreIndexedDB) Set(ctx context.Context, key, value string) error {
 	return <-ch
 }
 
+func (s *StoreIndexedDB) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	type result struct {
+		created bool
+		err     error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		tx := s.db.Call("transaction", s.storeName, "readwrite")
+		store := tx.Call("objectStore", s.storeName)
+
+		// Check if the key exists.
+		req := store.Call("get", key)
+		val, err := awaitRequest(req)
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		if !val.IsUndefined() && !val.IsNull() {
+			ch <- result{created: false}
+			return
+		}
+
+		// Key does not exist; write it within the same transaction.
+		store.Call("put", value, key)
+		if err := awaitTransaction(tx); err != nil {
+			ch <- result{err: err}
+			return
+		}
+		ch <- result{created: true}
+	}()
+	r := <-ch
+	return r.created, r.err
+}
+
 func (s *StoreIndexedDB) Delete(ctx context.Context, key string) error {
 	// Check existence first — IndexedDB delete is a no-op for missing keys.
 	_, err := s.Get(ctx, key)

@@ -61,6 +61,22 @@ func (s *StoreBadger) Set(ctx context.Context, key, value string) error {
 	})
 }
 
+func (s *StoreBadger) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	var created bool
+	err := s.db.Update(func(txn *badgerdb.Txn) error {
+		_, err := txn.Get([]byte(key))
+		if err == nil {
+			return nil // key exists
+		}
+		if err != badgerdb.ErrKeyNotFound {
+			return err
+		}
+		created = true
+		return txn.Set([]byte(key), []byte(value))
+	})
+	return created, err
+}
+
 func (s *StoreBadger) Delete(ctx context.Context, key string) error {
 	return s.db.Update(func(txn *badgerdb.Txn) error {
 		// Check if key exists first.

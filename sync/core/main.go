@@ -203,6 +203,89 @@ func (s *StoreSync) Set(ctx context.Context, key, value string) error {
 	return s.SetItem(ctx, "", key, value)
 }
 
+// SetIfNotExists writes the key only if it does not already exist in the sync view.
+// Returns true if the write succeeded (key was new), false if the key already existed.
+// Only records the write in the sync operation log if the key was actually created.
+//
+// Atomicity is delegated to the underlying store's SetIfNotExists on the view key,
+// so this is safe even when multiple StoreSync instances share the same database.
+func (s *StoreSync) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	item := SyncStoreItem{
+		App:       "",
+		Key:       key,
+		Value:     value,
+		Timestamp: time.Now().UnixNano(),
+		ID:        uuid.New().String(),
+	}
+
+	writeTime := time.Now().UnixNano() + s.timeOffset
+	item.WriteTimestamp = writeTime
+
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		return false, err
+	}
+
+	// Write the value and queue entry first (these are keyed by unique ID, so no conflict).
+	queueID := QueueID(writeTime, item.ID, item.Key)
+	if err := s.store.Set(ctx, ValueKey(item.ID), string(encoded)); err != nil {
+		return false, err
+	}
+	if err := s.store.Set(ctx, QueueKey(queueID), item.ID); err != nil {
+		s.store.Delete(ctx, ValueKey(item.ID))
+		return false, err
+	}
+
+	// Atomically claim the view key. The underlying store's SetIfNotExists
+	// provides database-level atomicity (e.g. SET NX, INSERT ON CONFLICT DO NOTHING,
+	// bbolt transaction), so this is safe across multiple processes.
+	created, err := s.store.SetIfNotExists(ctx, ViewKey(key), item.ID)
+	if err != nil {
+		s.store.Delete(ctx, QueueKey(queueID))
+		s.store.Delete(ctx, ValueKey(item.ID))
+		return false, err
+	}
+
+	if !created {
+		// View key already existed — another writer claimed it. Check if it's
+		// a tombstone (deleted item); if so, we can't use SetIfNotExists to
+		// reclaim it, so fall back to SetItem which overwrites.
+		existing, getErr := s.getItem(ctx, key)
+		if getErr == nil && existing.Deleted {
+			s.store.Delete(ctx, QueueKey(queueID))
+			s.store.Delete(ctx, ValueKey(item.ID))
+			if err := s.SetItem(ctx, "", key, value); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		// Key genuinely exists and is not deleted. Clean up our speculative writes.
+		s.store.Delete(ctx, QueueKey(queueID))
+		s.store.Delete(ctx, ValueKey(item.ID))
+		return false, nil
+	}
+
+	// Validate write time after performing writes — same check as setItemLocked.
+	// If the write took so long that writeTime is now in the past, a SyncOut cursor
+	// may have already advanced past this entry, causing the item to be missed.
+	if time.Now().UnixNano() > writeTime {
+		// Roll back: remove all three keys so we don't leave partial state.
+		s.store.Delete(ctx, ViewKey(key))
+		s.store.Delete(ctx, QueueKey(queueID))
+		s.store.Delete(ctx, ValueKey(item.ID))
+		return false, fmt.Errorf("write time is in the past")
+	}
+
+	// Send GC request to bounded worker pool (non-blocking).
+	select {
+	case s.gcCh <- gcRequest{key: item.Key, currentID: item.ID}:
+	default:
+	}
+
+	s.notifyListeners(item)
+	return true, nil
+}
+
 // Delete implements storemd.Store. Writes a tombstone that syncs to all peers.
 // Returns ErrNotFound if the key does not exist.
 func (s *StoreSync) Delete(ctx context.Context, key string) error {
