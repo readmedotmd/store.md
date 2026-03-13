@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	gosync "sync"
 	"sync/atomic"
 
@@ -215,7 +214,7 @@ func (m *StoreMessage) onSyncUpdate(item core.SyncStoreItem) {
 		m.handlersMu.RUnlock()
 
 		if !ok {
-			m.sendResponse(env.MessageID, "", fmt.Sprintf("no handler for type %q", env.Type))
+			m.sendResponse(env.MessageID, "", "unsupported message type")
 			return
 		}
 

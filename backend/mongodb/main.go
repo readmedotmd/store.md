@@ -95,6 +95,9 @@ func (s *StoreMongo) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Close is a no-op. The caller owns the mongo.Client lifecycle.
+func (s *StoreMongo) Close() error { return nil }
+
 func (s *StoreMongo) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

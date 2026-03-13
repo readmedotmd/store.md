@@ -259,8 +259,9 @@ func (c *Client) Close() error {
 }
 
 // initiateSync starts a sync exchange on a connection by calling Sync(nil).
-// Always sends a message, even if Sync returns nil, so the remote side gets
-// a chance to respond with its own data.
+// Only sends a message when there are items to sync. Sending empty payloads
+// would trigger unnecessary responses from the remote side, contributing to
+// sync loops.
 func (c *Client) initiateSync(mc *managedConn) {
 	ctx := context.Background()
 	payload, err := c.store.Sync(ctx, mc.PeerID(), nil)
@@ -269,7 +270,7 @@ func (c *Client) initiateSync(mc *managedConn) {
 		return
 	}
 	if payload == nil {
-		payload = &storesync.SyncPayload{}
+		return // nothing to send
 	}
 
 	mc.mu.Lock()

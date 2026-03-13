@@ -33,4 +33,7 @@ type Store interface {
 	SetIfNotExists(ctx context.Context, key, value string) (bool, error)
 	Delete(ctx context.Context, key string) (err error)
 	List(ctx context.Context, args ListArgs) (result []KeyValuePair, err error)
+	// Close releases any resources held by the store. Implementations that
+	// don't hold resources (e.g. in-memory) may return nil.
+	Close() error
 }

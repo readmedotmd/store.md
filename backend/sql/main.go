@@ -119,6 +119,9 @@ func (s *StoreSQL) Clear(ctx context.Context) error {
 	return err
 }
 
+// Close closes the underlying database connection.
+func (s *StoreSQL) Close() error { return s.db.Close() }
+
 func (s *StoreSQL) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	query := "SELECT key, value FROM kv_store"
 	var queryArgs []interface{}

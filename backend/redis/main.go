@@ -110,6 +110,9 @@ func (s *StoreRedis) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+// Close closes the underlying Redis client connection.
+func (s *StoreRedis) Close() error { return s.client.Close() }
+
 func (s *StoreRedis) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

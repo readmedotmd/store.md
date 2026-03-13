@@ -71,6 +71,7 @@ func (t *HTTPTransport) CanHandle(r *http.Request) bool {
 // the store, and writes the response. It does not use the adapter since
 // HTTP requests are stateless — each request is an independent sync exchange.
 func (t *HTTPTransport) Serve(w http.ResponseWriter, r *http.Request, peerID string, store storesync.SyncStore, _ *client.Client, logger *slog.Logger) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB limit
 	var msg client.Message
 	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)

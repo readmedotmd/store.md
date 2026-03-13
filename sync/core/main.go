@@ -23,6 +23,41 @@ const MaxClockSkew = 5 * time.Minute
 // UpdateListener is a callback invoked when an item is successfully written.
 type UpdateListener func(item SyncStoreItem)
 
+// Sync Hooks
+//
+// StoreSync supports three optional hooks that allow upper layers to customize
+// sync behavior without modifying the core protocol. Hooks are registered via
+// functional options (WithSyncOutFilter, WithSyncInFilter, WithPostSyncOut)
+// and multiple hooks of the same type can be stacked — they are evaluated in
+// registration order with short-circuit semantics for filters.
+//
+// These hooks enable patterns like:
+//   - Access control: filter which items are sent to which peers
+//   - Ephemeral messaging: skip persistence on the receiver, clean up after delivery
+//   - Audit logging: observe what was synced to each peer
+//
+// See the sync/ephemeral package for a complete example of building a layer
+// on top of these hooks.
+
+// SyncOutFilter decides whether an item should be included in a SyncOut
+// payload for a given peer. Return false to skip the item. The sync cursor
+// advances regardless, so filtered items won't block subsequent items.
+// Multiple filters are evaluated in order; the first false short-circuits.
+type SyncOutFilter func(item SyncStoreItem, peerID string) bool
+
+// SyncInFilter decides how an incoming item should be handled during SyncIn.
+// Return true to persist normally via setItem. Return false to skip
+// persistence — listeners registered via OnUpdate are still notified, so
+// upper layers can handle the item in memory without writing to the store.
+// Multiple filters are evaluated in order; the first false short-circuits.
+type SyncInFilter func(item SyncStoreItem, peerID string) (persist bool)
+
+// PostSyncOut is called after a successful SyncOut with the items that were
+// included in the outgoing payload and the target peer ID. Use for cleanup
+// (e.g., deleting ephemeral items after confirmed delivery) or audit logging.
+// Multiple callbacks are all invoked in registration order.
+type PostSyncOut func(ctx context.Context, items []SyncStoreItem, peerID string)
+
 type SyncStoreItem struct {
 	App            string `json:"app"`
 	Key            string `json:"key"`
@@ -51,6 +86,25 @@ func WithLogger(l *slog.Logger) Option {
 	return func(s *StoreSync) { s.logger = l }
 }
 
+// WithSyncOutFilter adds a filter applied during SyncOut. If any filter
+// returns false for an item, the item is excluded from the payload but the
+// sync cursor still advances past it.
+func WithSyncOutFilter(fn SyncOutFilter) Option {
+	return func(s *StoreSync) { s.syncOutFilters = append(s.syncOutFilters, fn) }
+}
+
+// WithSyncInFilter adds a filter applied during SyncIn. If any filter
+// returns false, the item is not persisted but listeners are still notified.
+func WithSyncInFilter(fn SyncInFilter) Option {
+	return func(s *StoreSync) { s.syncInFilters = append(s.syncInFilters, fn) }
+}
+
+// WithPostSyncOut adds a callback invoked after SyncOut with the items
+// that were included in the outgoing payload.
+func WithPostSyncOut(fn PostSyncOut) Option {
+	return func(s *StoreSync) { s.postSyncOuts = append(s.postSyncOuts, fn) }
+}
+
 type StoreSync struct {
 	store        storemd.Store
 	timeOffset   int64 // nanoseconds
@@ -59,6 +113,11 @@ type StoreSync struct {
 	listeners    map[uint64]UpdateListener
 	nextListenID atomic.Uint64
 	logger       *slog.Logger
+
+	// Hooks
+	syncOutFilters []SyncOutFilter
+	syncInFilters  []SyncInFilter
+	postSyncOuts   []PostSyncOut
 
 	// Bounded GC worker pool
 	gcCh chan gcRequest
@@ -120,6 +179,12 @@ func (s *StoreSync) startGCWorkers(n int) {
 			}
 		}(i)
 	}
+}
+
+// RawStore returns the underlying store, bypassing the sync layer.
+// Use with care — direct writes bypass conflict resolution and sync queuing.
+func (s *StoreSync) RawStore() storemd.Store {
+	return s.store
 }
 
 // Close stops GC workers and waits for them to finish.
@@ -440,6 +505,11 @@ func (s *StoreSync) setItemLocked(item SyncStoreItem) (*SyncStoreItem, error) {
 		return nil, fmt.Errorf("item timestamp too far in the future (clock skew exceeds %v)", MaxClockSkew)
 	}
 
+	minTimestamp := time.Now().UnixNano() - int64(MaxClockSkew)
+	if item.Timestamp < minTimestamp {
+		return nil, fmt.Errorf("item timestamp too far in the past (clock skew exceeds %v)", MaxClockSkew)
+	}
+
 	// Check if existing item is newer (use getItem to see tombstones too)
 	existing, err := s.getItem(ctx, item.Key)
 	if err != nil && !errors.Is(err, storemd.ErrNotFound) {
@@ -476,11 +546,14 @@ func (s *StoreSync) setItemLocked(item SyncStoreItem) (*SyncStoreItem, error) {
 	select {
 	case s.gcCh <- gcRequest{key: item.Key, currentID: item.ID}:
 	default:
-		// GC channel full — skip GC for this write, it will be caught later.
+		s.logger.Warn("gc channel full, skipping cleanup", "key", item.Key)
 	}
 
 	// Validate write time after performing writes (we want TOCTOU, else we will miss sync items)
 	if time.Now().UnixNano() > writeTime {
+		s.store.Delete(ctx, QueueKey(queueID))
+		s.store.Delete(ctx, ViewKey(item.Key))
+		s.store.Delete(ctx, ValueKey(item.ID))
 		return nil, fmt.Errorf("write time is in the past")
 	}
 
@@ -551,8 +624,19 @@ func (s *StoreSync) SyncIn(ctx context.Context, peerID string, payload SyncPaylo
 		return fmt.Errorf("sync payload too large: %d items (max %d)", len(payload.Items), MaxSyncInItems)
 	}
 	for _, item := range payload.Items {
-		if err := s.setItem(item); err != nil {
-			return err
+		persist := true
+		for _, filter := range s.syncInFilters {
+			if !filter(item, peerID) {
+				persist = false
+				break
+			}
+		}
+		if persist {
+			if err := s.setItem(item); err != nil {
+				return err
+			}
+		} else {
+			s.notifyListeners(item)
 		}
 	}
 	return nil
@@ -578,7 +662,7 @@ func (s *StoreSync) SyncOut(ctx context.Context, peerID string, limit int) (*Syn
 		}
 	}
 
-	payload, err := s.syncOut(ctx, lastSyncTimestamp, limit)
+	payload, err := s.syncOut(ctx, lastSyncTimestamp, limit, peerID)
 	if err != nil {
 		return nil, err
 	}
@@ -591,10 +675,16 @@ func (s *StoreSync) SyncOut(ctx context.Context, peerID string, limit int) (*Syn
 		return nil, err
 	}
 
+	if len(payload.Items) > 0 {
+		for _, fn := range s.postSyncOuts {
+			fn(ctx, payload.Items, peerID)
+		}
+	}
+
 	return payload, nil
 }
 
-func (s *StoreSync) syncOut(ctx context.Context, timestamp int64, limit int) (*SyncPayload, error) {
+func (s *StoreSync) syncOut(ctx context.Context, timestamp int64, limit int, peerID string) (*SyncPayload, error) {
 	now := time.Now().UnixNano()
 
 	args := storemd.ListArgs{
@@ -626,11 +716,30 @@ func (s *StoreSync) syncOut(ctx context.Context, timestamp int64, limit int) (*S
 			return nil, err
 		}
 
-		items = append(items, *item)
-
+		// Advance cursor only for items whose WriteTimestamp has matured
+		// (i.e. is no longer in the future). The time offset pushes WT
+		// into the future to create a buffer window: if multiple StoreSync
+		// instances share the same underlying store, a concurrent writer
+		// may not have committed yet. Keeping the cursor behind future-WT
+		// items ensures they are re-scanned until the window closes,
+		// preventing missed items.
 		if item.WriteTimestamp > lastSyncTimestamp && item.WriteTimestamp <= now {
 			lastSyncTimestamp = item.WriteTimestamp
 		}
+
+		// Apply SyncOut filters — skip item if any filter rejects it.
+		filtered := false
+		for _, filter := range s.syncOutFilters {
+			if !filter(*item, peerID) {
+				filtered = true
+				break
+			}
+		}
+		if filtered {
+			continue
+		}
+
+		items = append(items, *item)
 	}
 
 	return &SyncPayload{
@@ -644,7 +753,18 @@ func (s *StoreSync) syncOut(ctx context.Context, timestamp int64, limit int) (*S
 // Call with a payload to process incoming items (SyncIn) and return queued items (SyncOut).
 // Returns nil when there is nothing more to send.
 func (s *StoreSync) Sync(ctx context.Context, peerID string, incoming *SyncPayload) (*SyncPayload, error) {
+	var incomingIDs map[string]struct{}
+
 	if incoming != nil && len(incoming.Items) > 0 {
+		// Build a set of incoming item IDs so we can filter them from
+		// the SyncOut response. Without this, items the peer just sent
+		// us would be echoed back because SyncIn writes them to the
+		// local queue (with a new WriteTimestamp).
+		incomingIDs = make(map[string]struct{}, len(incoming.Items))
+		for _, item := range incoming.Items {
+			incomingIDs[item.ID] = struct{}{}
+		}
+
 		if err := s.SyncIn(ctx, peerID, *incoming); err != nil {
 			return nil, err
 		}
@@ -653,6 +773,17 @@ func (s *StoreSync) Sync(ctx context.Context, peerID string, incoming *SyncPaylo
 	payload, err := s.SyncOut(ctx, peerID, MaxSyncOutLimit)
 	if err != nil {
 		return nil, err
+	}
+
+	// Filter out items that the peer just sent us — don't echo them back.
+	if len(incomingIDs) > 0 && len(payload.Items) > 0 {
+		filtered := payload.Items[:0]
+		for _, item := range payload.Items {
+			if _, echo := incomingIDs[item.ID]; !echo {
+				filtered = append(filtered, item)
+			}
+		}
+		payload.Items = filtered
 	}
 
 	if len(payload.Items) == 0 {

@@ -182,6 +182,9 @@ func (s *StoreS3) Delete(ctx context.Context, key string) error {
 	return s.client.RemoveObject(ctx, s.bucket, s.fullKey(key), minio.RemoveObjectOptions{})
 }
 
+// Close is a no-op. The caller owns the minio.Client lifecycle.
+func (s *StoreS3) Close() error { return nil }
+
 func (s *StoreS3) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

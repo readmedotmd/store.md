@@ -44,6 +44,7 @@ type Server struct {
 
 	maxConnsPerPeer int
 	maxTotalConns   int
+	trustedProxies  map[string]struct{} // IPs trusted to set X-Forwarded-For
 
 	// Connection tracking
 	connsMu    gosync.Mutex
@@ -56,6 +57,8 @@ type Server struct {
 
 	adaptersMu gosync.Mutex
 	adapters   map[storesync.SyncStore]*client.Client
+
+	httpServer *http.Server // set by ListenAndServe/ListenAndServeTLS
 }
 
 type authFailEntry struct {
@@ -115,6 +118,17 @@ func (s *Server) SetMaxConnsPerPeer(n int) {
 // SetMaxTotalConns sets the maximum total connections. Default is 1000.
 func (s *Server) SetMaxTotalConns(n int) {
 	s.maxTotalConns = n
+}
+
+// SetTrustedProxies configures IP addresses trusted to set X-Forwarded-For.
+// When a request arrives from a trusted proxy, the client IP is extracted
+// from the X-Forwarded-For header instead of RemoteAddr. This is required
+// for accurate rate limiting behind reverse proxies and CDNs.
+func (s *Server) SetTrustedProxies(ips []string) {
+	s.trustedProxies = make(map[string]struct{}, len(ips))
+	for _, ip := range ips {
+		s.trustedProxies[ip] = struct{}{}
+	}
 }
 
 // SetAllowedOrigins configures which origins are allowed for WebSocket connections.
@@ -231,6 +245,10 @@ func (s *Server) checkAuthRateLimit(ip string) bool {
 func (s *Server) recordAuthFailure(ip string) {
 	s.authFailMu.Lock()
 	defer s.authFailMu.Unlock()
+	// Cap map size to prevent memory exhaustion from distributed attacks.
+	if len(s.authFailCount) >= 10000 {
+		return
+	}
 	entry, ok := s.authFailCount[ip]
 	if !ok || time.Now().After(entry.resetAt) {
 		s.authFailCount[ip] = &authFailEntry{
@@ -262,7 +280,9 @@ func (s *Server) acquireConn(peerID string) error {
 func (s *Server) releaseConn(peerID string) {
 	s.connsMu.Lock()
 	defer s.connsMu.Unlock()
-	s.totalConns--
+	if s.totalConns > 0 {
+		s.totalConns--
+	}
 	s.peerConns[peerID]--
 	if s.peerConns[peerID] <= 0 {
 		delete(s.peerConns, peerID)
@@ -289,12 +309,38 @@ func (n *notifyConn) Close() error {
 	return n.Connection.Close()
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Rate limit auth failures by IP.
+// CloseCodeAuthFailed is the WebSocket close status code sent when
+// authentication fails. The server upgrades the connection before
+// closing so that browser clients (which cannot read HTTP status
+// codes from failed upgrades) can detect auth failures.
+const CloseCodeAuthFailed = 4401
+
+// clientIP extracts the client IP from the request. If the request comes
+// from a trusted proxy and contains an X-Forwarded-For header, the leftmost
+// (original client) IP is used. Otherwise, RemoteAddr is used.
+func (s *Server) clientIP(r *http.Request) string {
 	ip := r.RemoteAddr
 	if idx := strings.LastIndex(ip, ":"); idx >= 0 {
 		ip = ip[:idx]
 	}
+	if len(s.trustedProxies) > 0 {
+		if _, trusted := s.trustedProxies[ip]; trusted {
+			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+				// X-Forwarded-For: client, proxy1, proxy2
+				// The leftmost entry is the original client.
+				if clientIP, _, ok := strings.Cut(xff, ","); ok {
+					return strings.TrimSpace(clientIP)
+				}
+				return strings.TrimSpace(xff)
+			}
+		}
+	}
+	return ip
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Rate limit auth failures by IP.
+	ip := s.clientIP(r)
 	if s.checkAuthRateLimit(ip) {
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
@@ -303,6 +349,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	peerID, err := s.auth(r)
 	if err != nil {
 		s.recordAuthFailure(ip)
+		// For WebSocket requests, upgrade first then close with 4401
+		// so browsers can distinguish auth failures from network errors.
+		// The browser WebSocket API does not expose HTTP status codes
+		// from failed upgrades — both 401 and network errors surface
+		// as close code 1006.
+		if websocket.IsWebSocketUpgrade(r) && s.wsTransport != nil {
+			ws, upgradeErr := s.wsTransport.Upgrader.Upgrade(w, r, nil)
+			if upgradeErr != nil {
+				return
+			}
+			ws.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(CloseCodeAuthFailed, "Unauthorized"))
+			ws.Close()
+			return
+		}
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -341,18 +402,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.releaseConn(peerID)
 }
 
-// ListenAndServe starts an HTTP server on the given address.
+// ListenAndServe starts an HTTP server on the given address. It blocks until
+// the server is stopped. Use Shutdown(ctx) for graceful shutdown.
 func (s *Server) ListenAndServe(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/", s)
-	return http.ListenAndServe(addr, mux)
+	s.httpServer = &http.Server{Addr: addr, Handler: mux}
+	return s.httpServer.ListenAndServe()
 }
 
-// ListenAndServeTLS starts an HTTPS server on the given address.
+// ListenAndServeTLS starts an HTTPS server on the given address. It blocks
+// until the server is stopped. Use Shutdown(ctx) for graceful shutdown.
 func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/", s)
-	return http.ListenAndServeTLS(addr, certFile, keyFile, mux)
+	s.httpServer = &http.Server{Addr: addr, Handler: mux}
+	return s.httpServer.ListenAndServeTLS(certFile, keyFile)
+}
+
+// Shutdown gracefully shuts down the HTTP server without interrupting
+// active connections, then closes all sync adapters.
+func (s *Server) Shutdown(ctx context.Context) error {
+	var shutdownErr error
+	if s.httpServer != nil {
+		shutdownErr = s.httpServer.Shutdown(ctx)
+	}
+	if err := s.CloseWithContext(ctx); err != nil && shutdownErr == nil {
+		shutdownErr = err
+	}
+	return shutdownErr
 }
 
 // Close closes all client adapters managed by this server, waiting for their

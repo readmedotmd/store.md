@@ -34,8 +34,8 @@ func (s *StoreMemory) Get(ctx context.Context, key string) (string, error) {
 
 func (s *StoreMemory) Set(ctx context.Context, key, value string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.data[key] = value
-	s.mu.Unlock()
 	return nil
 }
 
@@ -62,10 +62,13 @@ func (s *StoreMemory) Delete(ctx context.Context, key string) error {
 // Clear removes all key-value pairs from the store.
 func (s *StoreMemory) Clear(ctx context.Context) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.data = make(map[string]string)
-	s.mu.Unlock()
 	return nil
 }
+
+// Close is a no-op for the in-memory store.
+func (s *StoreMemory) Close() error { return nil }
 
 func (s *StoreMemory) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	s.mu.RLock()

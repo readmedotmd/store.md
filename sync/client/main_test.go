@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,5 +341,99 @@ func TestClient_CustomDialer(t *testing.T) {
 	}
 	if v != "custom-val" {
 		t.Fatalf("expected custom-val, got %q", v)
+	}
+}
+
+// countingConn wraps a Connection and counts write operations.
+type countingConn struct {
+	client.Connection
+	writes *atomic.Int64
+}
+
+func (c *countingConn) WriteMessage(msg client.Message) error {
+	c.writes.Add(1)
+	return c.Connection.WriteMessage(msg)
+}
+
+func TestNoSyncLoop_TwoClients(t *testing.T) {
+	ctx := context.Background()
+	// Use the default 10-second time offset to reproduce real-world behavior.
+	// With small offsets (like 100ms in other tests), items' WriteTimestamps
+	// become past-cursor quickly and the bug is masked.
+	serverStore := storesync.New(memory.New())
+	ts := startServer(t, serverStore)
+
+	// Client A with message counting
+	storeA := storesync.New(memory.New())
+	var writesA atomic.Int64
+	clientA := client.New(storeA, client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+		conn, err := client.Dial(peerID, url, header)
+		if err != nil {
+			return nil, err
+		}
+		return &countingConn{Connection: conn, writes: &writesA}, nil
+	}))
+	t.Cleanup(func() { clientA.Close() })
+
+	// Client B with message counting
+	storeB := storesync.New(memory.New())
+	var writesB atomic.Int64
+	clientB := client.New(storeB, client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+		conn, err := client.Dial(peerID, url, header)
+		if err != nil {
+			return nil, err
+		}
+		return &countingConn{Connection: conn, writes: &writesB}, nil
+	}))
+	t.Cleanup(func() { clientB.Close() })
+
+	if err := clientA.Connect("server", wsURL(ts), authHeader("token-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := clientB.Connect("server", wsURL(ts), authHeader("token-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync handshake to settle.
+	time.Sleep(500 * time.Millisecond)
+
+	// Write one item on Client A.
+	if err := storeA.SetItem(ctx, "app", "key1", "value1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for propagation to Client B.
+	deadline := time.After(3 * time.Second)
+	for {
+		item, err := storeB.GetItem(ctx, "key1")
+		if err == nil && item.Value == "value1" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for item to propagate to Client B")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Let the system settle, then snapshot message counts.
+	time.Sleep(500 * time.Millisecond)
+	snapshotA := writesA.Load()
+	snapshotB := writesB.Load()
+
+	// Wait and check that no more messages are being exchanged (quiescence).
+	time.Sleep(1 * time.Second)
+	finalA := writesA.Load()
+	finalB := writesB.Load()
+
+	// Allow at most 2 extra messages per client for stragglers.
+	if finalA-snapshotA > 2 {
+		t.Errorf("sync loop detected on Client A: %d messages sent after settling (snapshot=%d, final=%d)",
+			finalA-snapshotA, snapshotA, finalA)
+	}
+	if finalB-snapshotB > 2 {
+		t.Errorf("sync loop detected on Client B: %d messages sent after settling (snapshot=%d, final=%d)",
+			finalB-snapshotB, snapshotB, finalB)
 	}
 }

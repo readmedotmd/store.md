@@ -55,12 +55,25 @@ func TestAuth_InvalidToken(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("Authorization", "Bearer bad-token")
-	_, resp, err := websocket.DefaultDialer.Dial(wsURL(ts), header)
-	if err == nil {
-		t.Fatal("expected error for invalid token, got nil")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(ts), header)
+	if err != nil {
+		t.Fatalf("expected successful upgrade, got error: %v", err)
 	}
-	if resp != nil && resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.StatusCode)
+	defer conn.Close()
+
+	// The server upgrades the WebSocket then closes with 4401 so that
+	// browser clients can detect auth failures (HTTP status codes are
+	// not visible to the browser WebSocket API on failed upgrades).
+	_, _, readErr := conn.ReadMessage()
+	if readErr == nil {
+		t.Fatal("expected close error, got nil")
+	}
+	closeErr, ok := readErr.(*websocket.CloseError)
+	if !ok {
+		t.Fatalf("expected *websocket.CloseError, got %T: %v", readErr, readErr)
+	}
+	if closeErr.Code != CloseCodeAuthFailed {
+		t.Fatalf("expected close code %d, got %d", CloseCodeAuthFailed, closeErr.Code)
 	}
 }
 
@@ -135,19 +148,9 @@ func TestSyncPushItems(t *testing.T) {
 		t.Fatalf("WriteJSON failed: %v", err)
 	}
 
-	// The server processes the sync and may respond with its own items.
-	// For queue-based, Sync(peerID, incoming) applies items then SyncOuts.
-	// Read response - it may have items or be a sync with nil payload.
-	var resp client.Message
-	if err := conn.ReadJSON(&resp); err != nil {
-		// If server has nothing to send back, connection may just be idle.
-		// But with queue-based sync, SyncOut returns the items we just pushed
-		// (they're in the queue with future writeTimestamp, so they won't be returned).
-		// So we might not get a response. Let's verify the item was stored.
-	}
-
-	// Give it a moment to process
-	time.Sleep(100 * time.Millisecond)
+	// The server applies the items via SyncIn. It does NOT echo them back
+	// (Sync filters out items the sender just sent). Give it time to process.
+	time.Sleep(200 * time.Millisecond)
 
 	item, err := ss.GetItem(context.Background(), "pushed-key")
 	if err != nil {
@@ -689,5 +692,181 @@ func TestHTTP_WebSocketAndHTTPCoexist(t *testing.T) {
 	}
 	if httpResp.Payload == nil || len(httpResp.Payload.Items) < 1 {
 		t.Fatal("expected at least 1 item from HTTP sync")
+	}
+}
+
+func TestHTTP_BodySizeLimit(t *testing.T) {
+	srv, _ := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Create a body larger than the 10MB limit.
+	bigBody := make([]byte, 11<<20) // 11MB
+	for i := range bigBody {
+		bigBody[i] = 'a'
+	}
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL, bytes.NewReader(bigBody))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token-peer1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 for oversized body, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestHTTP_MalformedJSON(t *testing.T) {
+	srv, _ := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("{invalid json"))
+	if err != nil {
+		t.Fatalf("NewRequest failed: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer token-peer1")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400 for malformed JSON, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestHTTP_MalformedPayload_HugeTimestamp(t *testing.T) {
+	srv, ss := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Item with a timestamp far in the future (should be rejected by clock skew check).
+	payload := storesync.SyncPayload{
+		Items: []storesync.SyncStoreItem{
+			{
+				App:       "app",
+				Key:       "future-key",
+				Value:     "val",
+				Timestamp: time.Now().UnixNano() + int64(time.Hour),
+				ID:        "future-id",
+			},
+		},
+	}
+
+	msg := client.Message{Type: "sync", Payload: &payload}
+	resp := httpPost(t, ts.URL, "token-peer1", msg)
+	defer resp.Body.Close()
+
+	// The sync should either reject the item or return an error.
+	// The item should NOT be persisted.
+	time.Sleep(100 * time.Millisecond)
+	_, err := ss.GetItem(context.Background(), "future-key")
+	if err == nil {
+		t.Fatal("item with huge future timestamp should not be persisted")
+	}
+}
+
+func TestHTTP_MalformedPayload_PastTimestamp(t *testing.T) {
+	srv, ss := newHTTPTestServer(t)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Item with a very old timestamp (should be rejected by clock skew check).
+	payload := storesync.SyncPayload{
+		Items: []storesync.SyncStoreItem{
+			{
+				App:       "app",
+				Key:       "ancient-key",
+				Value:     "val",
+				Timestamp: 1000000, // ~1970
+				ID:        "ancient-id",
+			},
+		},
+	}
+
+	msg := client.Message{Type: "sync", Payload: &payload}
+	resp := httpPost(t, ts.URL, "token-peer1", msg)
+	defer resp.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+	_, err := ss.GetItem(context.Background(), "ancient-key")
+	if err == nil {
+		t.Fatal("item with ancient timestamp should not be persisted")
+	}
+}
+
+func TestServer_TrustedProxies(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.SetTrustedProxies([]string{"127.0.0.1"})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// With a trusted proxy, the X-Forwarded-For header should be respected.
+	// Make many bad auth attempts with different X-Forwarded-For IPs —
+	// they should each get their own rate limit bucket.
+	for i := range 15 {
+		header := http.Header{}
+		header.Set("Authorization", "Bearer bad-token")
+		header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i))
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("{}"))
+		req.Header = header
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		resp.Body.Close()
+		// Each unique IP should get 401, not 429 (since each is a fresh IP).
+		if resp.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("request %d got 429 despite unique X-Forwarded-For IP", i)
+		}
+	}
+}
+
+func TestServer_UntrustedProxy_IgnoresXFF(t *testing.T) {
+	srv, _ := newTestServer(t)
+	// Don't set any trusted proxies — X-Forwarded-For should be ignored.
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// All requests come from the same RemoteAddr (the test client).
+	// After 10 failures, should get rate limited.
+	for i := range 15 {
+		header := http.Header{}
+		header.Set("Authorization", "Bearer bad-token")
+		header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i)) // should be ignored
+
+		req, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("{}"))
+		req.Header = header
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		resp.Body.Close()
+	}
+	// After 10+ failures from same IP, should be rate limited.
+	req, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer bad-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after rate limit, got %d", resp.StatusCode)
 	}
 }

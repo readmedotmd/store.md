@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -60,6 +61,8 @@ func (s *memStore) Delete(_ context.Context, key string) error {
 	delete(s.data, key)
 	return nil
 }
+
+func (s *memStore) Close() error { return nil }
 
 func (s *memStore) List(_ context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
 	s.mu.RLock()
@@ -456,7 +459,7 @@ func TestSyncIn_TimestampConflict(t *testing.T) {
 				App:       "app",
 				Key:       "key1",
 				Value:     "remote-old",
-				Timestamp: 1, // very old timestamp
+				Timestamp: time.Now().UnixNano() - int64(10*time.Second), // older but within clock skew
 				ID:        "remote-id",
 			},
 		},
@@ -629,7 +632,7 @@ func TestOnUpdate_NotCalledForOlderTimestamp(t *testing.T) {
 				App:       "app",
 				Key:       "key1",
 				Value:     "old",
-				Timestamp: 1,
+				Timestamp: time.Now().UnixNano() - int64(10*time.Second), // older but within clock skew
 				ID:        "old-id",
 			},
 		},
@@ -1114,5 +1117,652 @@ func TestSetIfNotExists_OnUpdateFires(t *testing.T) {
 	}
 	if updates[0].Key != "notify-key" || updates[0].Value != "notify-value" {
 		t.Fatalf("unexpected update: %+v", updates[0])
+	}
+}
+
+// --- Hook tests ---
+
+func TestSyncOutFilter_ExcludesItems(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncOutFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "secret" // exclude key "secret"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "public", "pub-val"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.SetItem(ctx, "", "secret", "sec-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, item := range payload.Items {
+		if item.Key == "secret" {
+			t.Fatal("filter should have excluded 'secret'")
+		}
+	}
+	found := false
+	for _, item := range payload.Items {
+		if item.Key == "public" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected 'public' to be included")
+	}
+}
+
+func TestSyncOutFilter_CursorAdvancesPastFilteredItems(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(1*time.Millisecond)),
+		WithSyncOutFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "filtered"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "filtered", "val1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if err := ss.SetItem(ctx, "", "visible", "val2"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	// First sync: should get "visible" only
+	p1, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p1.Items) != 1 || p1.Items[0].Key != "visible" {
+		t.Fatalf("expected [visible], got %v", p1.Items)
+	}
+
+	// Second sync: cursor should have advanced past both items
+	p2, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p2.Items) != 0 {
+		t.Fatalf("expected 0 items on second sync, got %d", len(p2.Items))
+	}
+}
+
+func TestSyncOutFilter_PerPeer(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncOutFilter(func(item SyncStoreItem, peerID string) bool {
+			// Only "admin" items go to peer "admin", everything else goes everywhere
+			if item.App == "admin" {
+				return peerID == "admin-peer"
+			}
+			return true
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "admin", "config", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.SetItem(ctx, "public", "info", "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Admin peer should get both
+	adminPayload, err := ss.SyncOut(ctx, "admin-peer", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adminPayload.Items) != 2 {
+		t.Fatalf("admin should get 2 items, got %d", len(adminPayload.Items))
+	}
+
+	// Regular peer should only get the public item
+	regularPayload, err := ss.SyncOut(ctx, "regular-peer", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(regularPayload.Items) != 1 {
+		t.Fatalf("regular peer should get 1 item, got %d", len(regularPayload.Items))
+	}
+	if regularPayload.Items[0].Key != "info" {
+		t.Fatalf("regular peer should get 'info', got %q", regularPayload.Items[0].Key)
+	}
+}
+
+func TestSyncOutFilter_MultipleFilters(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncOutFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "a" // exclude "a"
+		}),
+		WithSyncOutFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "b" // exclude "b"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	for _, k := range []string{"a", "b", "c"} {
+		if err := ss.SetItem(ctx, "", k, "val"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].Key != "c" {
+		t.Fatalf("expected only [c], got %v", payload.Items)
+	}
+}
+
+func TestSyncInFilter_SkipPersist(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncInFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "transient" // don't persist "transient"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "persistent", Value: "val1", Timestamp: time.Now().UnixNano(), ID: "id-1"},
+			{Key: "transient", Value: "val2", Timestamp: time.Now().UnixNano(), ID: "id-2"},
+		},
+	}
+
+	if err := ss.SyncIn(ctx, "peer1", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// "persistent" should be retrievable
+	val, err := ss.Get(ctx, "persistent")
+	if err != nil {
+		t.Fatalf("expected persistent item: %v", err)
+	}
+	if val != "val1" {
+		t.Fatalf("expected val1, got %q", val)
+	}
+
+	// "transient" should NOT be persisted
+	_, err = ss.Get(ctx, "transient")
+	if err == nil {
+		t.Fatal("expected transient item to not be persisted")
+	}
+}
+
+func TestSyncInFilter_ListenersStillFire(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncInFilter(func(item SyncStoreItem, peerID string) bool {
+			return false // never persist
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	var received []SyncStoreItem
+	ss.OnUpdate(func(item SyncStoreItem) {
+		received = append(received, item)
+	})
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "notif-key", Value: "notif-val", Timestamp: time.Now().UnixNano(), ID: "notif-id"},
+		},
+	}
+
+	if err := ss.SyncIn(ctx, "peer1", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(received) != 1 {
+		t.Fatalf("expected 1 listener notification, got %d", len(received))
+	}
+	if received[0].Key != "notif-key" {
+		t.Fatalf("expected key 'notif-key', got %q", received[0].Key)
+	}
+}
+
+func TestSyncInFilter_MultipleFilters(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncInFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "skip-a"
+		}),
+		WithSyncInFilter(func(item SyncStoreItem, peerID string) bool {
+			return item.Key != "skip-b"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "skip-a", Value: "a", Timestamp: time.Now().UnixNano(), ID: "id-a"},
+			{Key: "skip-b", Value: "b", Timestamp: time.Now().UnixNano(), ID: "id-b"},
+			{Key: "keep", Value: "c", Timestamp: time.Now().UnixNano(), ID: "id-c"},
+		},
+	}
+
+	if err := ss.SyncIn(ctx, "peer1", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only "keep" should be persisted
+	val, err := ss.Get(ctx, "keep")
+	if err != nil {
+		t.Fatalf("expected 'keep': %v", err)
+	}
+	if val != "c" {
+		t.Fatalf("expected 'c', got %q", val)
+	}
+
+	if _, err := ss.Get(ctx, "skip-a"); err == nil {
+		t.Fatal("skip-a should not be persisted")
+	}
+	if _, err := ss.Get(ctx, "skip-b"); err == nil {
+		t.Fatal("skip-b should not be persisted")
+	}
+}
+
+func TestSyncInFilter_PeerIDPassedCorrectly(t *testing.T) {
+	store := newMemStore()
+	var capturedPeerID string
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithSyncInFilter(func(item SyncStoreItem, peerID string) bool {
+			capturedPeerID = peerID
+			return true
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "k", Value: "v", Timestamp: time.Now().UnixNano(), ID: "some-id"},
+		},
+	}
+
+	if err := ss.SyncIn(ctx, "my-peer-42", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	if capturedPeerID != "my-peer-42" {
+		t.Fatalf("expected peerID 'my-peer-42', got %q", capturedPeerID)
+	}
+}
+
+func TestPostSyncOut_Called(t *testing.T) {
+	store := newMemStore()
+	var calledWith []SyncStoreItem
+	var calledPeerID string
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPostSyncOut(func(ctx context.Context, items []SyncStoreItem, peerID string) {
+			calledWith = items
+			calledPeerID = peerID
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ss.SyncOut(ctx, "target-peer", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(calledWith) != 1 {
+		t.Fatalf("expected PostSyncOut called with 1 item, got %d", len(calledWith))
+	}
+	if calledWith[0].Key != "k1" {
+		t.Fatalf("expected key 'k1', got %q", calledWith[0].Key)
+	}
+	if calledPeerID != "target-peer" {
+		t.Fatalf("expected peerID 'target-peer', got %q", calledPeerID)
+	}
+}
+
+func TestPostSyncOut_NotCalledWhenEmpty(t *testing.T) {
+	store := newMemStore()
+	called := false
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPostSyncOut(func(ctx context.Context, items []SyncStoreItem, peerID string) {
+			called = true
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	// No items written — SyncOut should not trigger PostSyncOut
+	_, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if called {
+		t.Fatal("PostSyncOut should not be called when no items are sent")
+	}
+}
+
+func TestPostSyncOut_MultipleCallbacks(t *testing.T) {
+	store := newMemStore()
+	var count1, count2 int
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPostSyncOut(func(ctx context.Context, items []SyncStoreItem, peerID string) {
+			count1++
+		}),
+		WithPostSyncOut(func(ctx context.Context, items []SyncStoreItem, peerID string) {
+			count2++
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if count1 != 1 || count2 != 1 {
+		t.Fatalf("expected both PostSyncOut callbacks called once, got %d and %d", count1, count2)
+	}
+}
+
+func TestRawStore(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss.Close()
+
+	raw := ss.RawStore()
+	if raw != store {
+		t.Fatal("RawStore should return the underlying store")
+	}
+
+	// Direct writes bypass sync layer
+	ctx := context.Background()
+	if err := raw.Set(ctx, "direct-key", "direct-val"); err != nil {
+		t.Fatal(err)
+	}
+	val, err := raw.Get(ctx, "direct-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "direct-val" {
+		t.Fatalf("expected 'direct-val', got %q", val)
+	}
+
+	// Not accessible via sync layer (no view key)
+	_, err = ss.Get(ctx, "direct-key")
+	if err == nil {
+		t.Fatal("direct write should not be visible via sync layer")
+	}
+}
+
+func TestNoHooks_DefaultBehaviorUnchanged(t *testing.T) {
+	// Verify that a StoreSync with no hooks behaves identically to before
+	store := newMemStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// SyncOut should include all items
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(payload.Items))
+	}
+
+	// SyncIn should persist all items
+	store2 := newMemStore()
+	ss2 := NewWithOptions(store2, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss2.Close()
+
+	if err := ss2.SyncIn(ctx, "peer1", *payload); err != nil {
+		t.Fatal(err)
+	}
+	val, err := ss2.Get(ctx, "k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "v1" {
+		t.Fatalf("expected 'v1', got %q", val)
+	}
+}
+
+// TestSyncOut_CursorSafety_MultiInstance verifies that the SyncOut cursor
+// does NOT advance past items with future WriteTimestamps. This protects
+// against a real scenario where multiple StoreSync instances share the same
+// backing store (e.g. two server processes on the same database).
+//
+// The time offset pushes WriteTimestamp into the future (WT = now + offset).
+// If a concurrent writer on another instance hasn't committed yet, a SyncOut
+// scan on this instance could see a later item (higher WT), advance the
+// cursor past the yet-to-be-committed item, and permanently skip it.
+//
+// Timeline:
+//
+//	Instance A: writes item-1 at WT_A (slow, hasn't committed yet)
+//	Instance B: writes item-2 at WT_B > WT_A (fast, committed)
+//	SyncOut:    scans queue, sees item-2 at WT_B
+//	            if cursor advances to WT_B → item-1 (at WT_A < WT_B) is skipped forever
+//	            if cursor stays behind WT_B → next SyncOut catches item-1 ✓
+//
+// We simulate this by writing directly to the raw store (bypassing writeMu),
+// as a second StoreSync instance sharing the same store would.
+func TestSyncOut_CursorSafety_MultiInstance(t *testing.T) {
+	store := newTestStore()
+	// Use a large offset so WriteTimestamps are well into the future.
+	offset := int64(10 * time.Second)
+	ss := New(store, offset)
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Instance B writes item-2 first (higher WT because it starts later).
+	if err := ss.SetItem(ctx, "app", "item-2", "val-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// SyncOut for "remote-peer": returns item-2. Cursor must NOT advance
+	// past item-2's future WT because instance A hasn't committed item-1 yet.
+	payload1, err := ss.SyncOut(ctx, "remote-peer", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload1.Items) != 1 || payload1.Items[0].Key != "item-2" {
+		t.Fatalf("expected [item-2], got %v", payload1.Items)
+	}
+
+	// Simulate Instance A committing item-1 AFTER the SyncOut above.
+	// In real life this is a second StoreSync on the same DB whose write
+	// was in-flight during the scan. We write with a WT slightly before
+	// item-2's WT to model the race.
+	item1WT := payload1.Items[0].WriteTimestamp - 1 // just before item-2
+	item1 := SyncStoreItem{
+		App:            "app",
+		Key:            "item-1",
+		Value:          "val-1",
+		Timestamp:      time.Now().UnixNano(),
+		ID:             "late-writer-id",
+		WriteTimestamp: item1WT,
+	}
+	// Write directly to the raw store as the other instance would.
+	encoded, _ := json.Marshal(item1)
+	queueID := QueueID(item1WT, item1.ID, item1.Key)
+	store.Set(ctx, QueueKey(queueID), item1.ID)
+	store.Set(ctx, ValueKey(item1.ID), string(encoded))
+	store.Set(ctx, ViewKey(item1.Key), item1.ID)
+
+	// Second SyncOut: must include item-1 because the cursor should NOT
+	// have advanced past its WT (which is in the future). If the cursor
+	// had advanced to item-2's WT, item-1 would be permanently lost.
+	payload2, err := ss.SyncOut(ctx, "remote-peer", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// We expect to see both item-1 (newly committed) and item-2 (cursor
+	// didn't advance past it because WT > now).
+	keys := map[string]bool{}
+	for _, item := range payload2.Items {
+		keys[item.Key] = true
+	}
+	if !keys["item-1"] {
+		t.Errorf("item-1 missing from second SyncOut — cursor advanced too far")
+		t.Logf("got items: %v", payload2.Items)
+	}
+	if !keys["item-2"] {
+		t.Errorf("item-2 missing from second SyncOut — should still be returned (WT in future)")
+		t.Logf("got items: %v", payload2.Items)
+	}
+}
+
+func TestGC_ChannelFull_NoDataLoss(t *testing.T) {
+	// Verify that writes succeed even when the GC channel is full.
+	// The GC channel has capacity 256. We flood it by writing more items
+	// than the channel can hold, then verify all items are retrievable.
+	store := newMemStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss.Close()
+	ctx := context.Background()
+
+	const n = 300 // more than GC channel capacity (256)
+	for i := range n {
+		key := fmt.Sprintf("gc-key-%d", i)
+		if err := ss.SetItem(ctx, "", key, fmt.Sprintf("val-%d", i)); err != nil {
+			t.Fatalf("SetItem %d failed: %v", i, err)
+		}
+	}
+
+	// All items should be retrievable despite GC channel overflow.
+	for i := range n {
+		key := fmt.Sprintf("gc-key-%d", i)
+		item, err := ss.GetItem(ctx, key)
+		if err != nil {
+			t.Fatalf("GetItem %q failed: %v", key, err)
+		}
+		expected := fmt.Sprintf("val-%d", i)
+		if item.Value != expected {
+			t.Fatalf("key %q: expected %q, got %q", key, expected, item.Value)
+		}
+	}
+}
+
+func TestGC_ChannelFull_UpdatesStillWork(t *testing.T) {
+	// When GC channel is full, updating a key should still work correctly
+	// even though old values won't be cleaned up immediately.
+	store := newMemStore()
+	// Use a large offset so that rapid writes don't trigger the write-time-in-the-past check.
+	ss := NewWithOptions(store, WithTimeOffset(int64(10*time.Second)))
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Fill the GC channel by writing many different keys.
+	for i := range 260 {
+		if err := ss.SetItem(ctx, "", fmt.Sprintf("filler-%d", i), "x"); err != nil {
+			t.Fatalf("SetItem filler %d failed: %v", i, err)
+		}
+	}
+
+	// Now update a single key multiple times. Each update should succeed
+	// and return the latest value, regardless of GC backpressure.
+	for i := range 10 {
+		if err := ss.SetItem(ctx, "", "contested", fmt.Sprintf("v%d", i)); err != nil {
+			t.Fatalf("SetItem contested %d failed: %v", i, err)
+		}
+	}
+
+	item, err := ss.GetItem(ctx, "contested")
+	if err != nil {
+		t.Fatalf("GetItem contested failed: %v", err)
+	}
+	if item.Value != "v9" {
+		t.Fatalf("expected v9, got %q", item.Value)
+	}
+}
+
+func TestSyncIn_RejectsFutureTimestamp(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{
+				Key:       "future-key",
+				Value:     "val",
+				Timestamp: time.Now().UnixNano() + int64(time.Hour),
+				ID:        "future-id",
+			},
+		},
+	}
+
+	err := ss.SyncIn(ctx, "peer1", payload)
+	if err == nil {
+		t.Fatal("expected error for item with future timestamp")
+	}
+}
+
+func TestSyncIn_RejectsPastTimestamp(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{
+				Key:       "ancient-key",
+				Value:     "val",
+				Timestamp: 1000000, // ~1970
+				ID:        "ancient-id",
+			},
+		},
+	}
+
+	err := ss.SyncIn(ctx, "peer1", payload)
+	if err == nil {
+		t.Fatal("expected error for item with ancient timestamp")
 	}
 }
