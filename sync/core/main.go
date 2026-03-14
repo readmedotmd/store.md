@@ -505,11 +505,6 @@ func (s *StoreSync) setItemLocked(item SyncStoreItem) (*SyncStoreItem, error) {
 		return nil, fmt.Errorf("item timestamp too far in the future (clock skew exceeds %v)", MaxClockSkew)
 	}
 
-	minTimestamp := time.Now().UnixNano() - int64(MaxClockSkew)
-	if item.Timestamp < minTimestamp {
-		return nil, fmt.Errorf("item timestamp too far in the past (clock skew exceeds %v)", MaxClockSkew)
-	}
-
 	// Check if existing item is newer (use getItem to see tombstones too)
 	existing, err := s.getItem(ctx, item.Key)
 	if err != nil && !errors.Is(err, storemd.ErrNotFound) {

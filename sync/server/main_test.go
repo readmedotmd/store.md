@@ -780,12 +780,12 @@ func TestHTTP_MalformedPayload_HugeTimestamp(t *testing.T) {
 	}
 }
 
-func TestHTTP_MalformedPayload_PastTimestamp(t *testing.T) {
+func TestHTTP_PastTimestamp_Accepted(t *testing.T) {
 	srv, ss := newHTTPTestServer(t)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	// Item with a very old timestamp (should be rejected by clock skew check).
+	// Items with old timestamps are valid in offline-first sync (LWW resolves conflicts).
 	payload := storesync.SyncPayload{
 		Items: []storesync.SyncStoreItem{
 			{
@@ -803,9 +803,12 @@ func TestHTTP_MalformedPayload_PastTimestamp(t *testing.T) {
 	defer resp.Body.Close()
 
 	time.Sleep(100 * time.Millisecond)
-	_, err := ss.GetItem(context.Background(), "ancient-key")
-	if err == nil {
-		t.Fatal("item with ancient timestamp should not be persisted")
+	item, err := ss.GetItem(context.Background(), "ancient-key")
+	if err != nil {
+		t.Fatalf("old-timestamp item should be accepted, got: %v", err)
+	}
+	if item.Value != "val" {
+		t.Fatalf("expected value 'val', got %q", item.Value)
 	}
 }
 

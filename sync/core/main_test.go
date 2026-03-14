@@ -1744,7 +1744,7 @@ func TestSyncIn_RejectsFutureTimestamp(t *testing.T) {
 	}
 }
 
-func TestSyncIn_RejectsPastTimestamp(t *testing.T) {
+func TestSyncIn_AcceptsPastTimestamp(t *testing.T) {
 	store := newMemStore()
 	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)))
 	defer ss.Close()
@@ -1762,7 +1762,15 @@ func TestSyncIn_RejectsPastTimestamp(t *testing.T) {
 	}
 
 	err := ss.SyncIn(ctx, "peer1", payload)
-	if err == nil {
-		t.Fatal("expected error for item with ancient timestamp")
+	if err != nil {
+		t.Fatalf("old-timestamp items should be accepted for offline-first sync, got: %v", err)
+	}
+
+	item, err := ss.GetItem(ctx, "ancient-key")
+	if err != nil {
+		t.Fatalf("expected item to be persisted, got: %v", err)
+	}
+	if item.Value != "val" {
+		t.Fatalf("expected value 'val', got %q", item.Value)
 	}
 }
