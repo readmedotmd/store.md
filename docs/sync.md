@@ -184,6 +184,72 @@ unsub()
 
 ---
 
+## Hooks
+
+StoreSync supports hooks that allow customizing sync behavior without modifying the core protocol:
+
+### PreSetItem Hook
+
+Called before an item is written to the store. Can modify the item (e.g., add signatures) before storage. The item's Timestamp, ID, and WriteTimestamp are already set when this hook is called.
+
+```go
+ss := core.NewWithOptions(store,
+    core.WithPreSetItem(func(item *core.SyncStoreItem) {
+        // Add signature
+        item.PublicKey = myPublicKey
+        item.Signature = sign(item)
+    }),
+)
+```
+
+Multiple hooks are called in order; each hook receives the (possibly modified) item from the previous hook.
+
+### SyncOutFilter Hook
+
+Decides whether an item should be included in a SyncOut payload for a given peer:
+
+```go
+ss := core.NewWithOptions(store,
+    core.WithSyncOutFilter(func(item core.SyncStoreItem, peerID string) bool {
+        // Only send "chat" app to peer1
+        if peerID == "peer1" {
+            return item.App == "chat"
+        }
+        return true
+    }),
+)
+```
+
+### SyncInFilter Hook
+
+Decides how an incoming item should be handled during SyncIn:
+
+```go
+ss := core.NewWithOptions(store,
+    core.WithSyncInFilter(func(item core.SyncStoreItem, peerID string) bool {
+        // Reject items without signatures
+        return item.Signature != ""
+    }),
+)
+```
+
+Return `true` to persist normally, `false` to skip persistence (listeners are still notified).
+
+### PostSyncOut Hook
+
+Called after a successful SyncOut with the items that were included:
+
+```go
+ss := core.NewWithOptions(store,
+    core.WithPostSyncOut(func(ctx context.Context, items []core.SyncStoreItem, peerID string) {
+        // Log what was sent
+        log.Printf("Sent %d items to %s", len(items), peerID)
+    }),
+)
+```
+
+---
+
 ## Time Offset
 
 The `StoreSync` constructor accepts an optional time offset (in nanoseconds):

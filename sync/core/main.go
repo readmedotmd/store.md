@@ -58,6 +58,13 @@ type SyncInFilter func(item SyncStoreItem, peerID string) (persist bool)
 // Multiple callbacks are all invoked in registration order.
 type PostSyncOut func(ctx context.Context, items []SyncStoreItem, peerID string)
 
+// PreSetItem is called before an item is written to the store.
+// It can modify the item (e.g., add signatures) before storage.
+// The item's Timestamp and ID are already set when this hook is called.
+// Multiple hooks are called in order; each hook receives the (possibly modified)
+// item from the previous hook.
+type PreSetItem func(item *SyncStoreItem)
+
 type SyncStoreItem struct {
 	App            string `json:"app"`
 	Key            string `json:"key"`
@@ -66,6 +73,10 @@ type SyncStoreItem struct {
 	ID             string `json:"id"`
 	WriteTimestamp int64  `json:"writeTimestamp"`
 	Deleted        bool   `json:"deleted,omitempty"`
+	// Optional: sender's public key for signature verification (access control plugins)
+	PublicKey string `json:"publicKey,omitempty"`
+	// Optional: signature of the item (access control plugins)
+	Signature string `json:"signature,omitempty"`
 }
 
 // gcRequest is a request to garbage-collect old values for a key.
@@ -105,6 +116,12 @@ func WithPostSyncOut(fn PostSyncOut) Option {
 	return func(s *StoreSync) { s.postSyncOuts = append(s.postSyncOuts, fn) }
 }
 
+// WithPreSetItem adds a hook called before an item is written.
+// Use this to modify items before storage (e.g., add signatures).
+func WithPreSetItem(fn PreSetItem) Option {
+	return func(s *StoreSync) { s.preSetItems = append(s.preSetItems, fn) }
+}
+
 type StoreSync struct {
 	store        storemd.Store
 	timeOffset   int64 // nanoseconds
@@ -118,6 +135,7 @@ type StoreSync struct {
 	syncOutFilters []SyncOutFilter
 	syncInFilters  []SyncInFilter
 	postSyncOuts   []PostSyncOut
+	preSetItems    []PreSetItem
 
 	// Bounded GC worker pool
 	gcCh chan gcRequest
@@ -516,6 +534,11 @@ func (s *StoreSync) setItemLocked(item SyncStoreItem) (*SyncStoreItem, error) {
 
 	item.WriteTimestamp = writeTime
 	queueID := QueueID(writeTime, item.ID, item.Key)
+
+	// Apply PreSetItem hooks - allow modification before storage
+	for _, hook := range s.preSetItems {
+		hook(&item)
+	}
 
 	encoded, err := json.Marshal(item)
 	if err != nil {
