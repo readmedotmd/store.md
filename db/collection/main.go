@@ -10,7 +10,8 @@
 //   - Index key: {prefix}{collection}/%idx%{docID} → "1"
 //   - Field keys: {prefix}{collection}/{docID}/{fieldName} → JSON-encoded value
 //
-// For example, a collection named "todos" stores:
+// For example, a collection named "todos" with a struct containing Title,
+// Done, and CreatedAt fields stores:
 //
 //	todos/%idx%abc123          → "1"
 //	todos/abc123/title         → "Buy groceries"
@@ -27,24 +28,57 @@
 //
 // Field names are derived from `json` struct tags (falling back to the Go
 // field name). Fields tagged `json:"-"` are skipped. Each field value is
-// JSON-encoded as the store value string.
+// JSON-encoded as the store value string. Options after a comma in the json
+// tag are ignored for naming purposes (e.g. `json:"name,omitempty"` uses
+// "name" as the key segment).
 //
 // Only flat structs with exported fields are supported. Nested structs,
 // slices, and maps are serialized as a single JSON value into one key
-// (they won't get field-level LWW).
+// (they won't get field-level LWW). Unexported fields are always ignored.
 //
 // # Listing documents
 //
 // [Collection.List] supports the same pagination options as [storemd.ListArgs]:
 // Prefix (filters doc IDs), StartAfter (doc ID cursor), and Limit (max
 // documents returned). Listing scans the index keys and then assembles each
-// document from its field keys.
+// document from its field keys. Documents are always returned in lexicographic
+// order by ID.
+//
+// The [ListArgs] parameter is variadic for convenience — calling List(ctx)
+// with no args returns all documents.
 //
 // # Partial documents
 //
 // If a sync has delivered some fields but not others, [Collection.Get]
 // returns a partially-filled struct (Go zero values for missing fields).
-// This is expected behavior for field-level LWW.
+// This is expected behavior for field-level LWW. Similarly, [Collection.List]
+// assembles each document from whatever field keys exist — missing fields
+// are left as Go zero values.
+//
+// # Sync store integration
+//
+// Collection works with any [storemd.Store], including sync stores (which
+// implement the Store interface). When used with a sync store, each field
+// key syncs independently, giving automatic field-level LWW conflict
+// resolution. Two nodes can update different fields of the same document
+// concurrently and both changes will merge cleanly.
+//
+// For best performance with a sync store, wrap the store in a
+// [cache.StoreCache] and wire up invalidation:
+//
+//	ss := core.New(backend)
+//	cached := cache.New(ss)
+//	ss.OnUpdate(func(item core.SyncStoreItem) {
+//	    cached.InvalidateKey(item.Key)
+//	})
+//	c := collection.New[Todo](cached, "todos")
+//
+// # Thread safety
+//
+// Collection itself has no mutable state after construction — all state lives
+// in the underlying [storemd.Store]. Thread safety depends entirely on the
+// store implementation. All standard store implementations (memory, bbolt,
+// badger, sql, sync) are safe for concurrent use, so Collection is too.
 //
 // # Usage
 //
@@ -55,11 +89,14 @@
 //
 //	c := collection.New[Todo](store, "todos")
 //
-//	// Create
+//	// Create or update
 //	c.Set(ctx, "abc123", Todo{Title: "Buy groceries", Done: false})
 //
 //	// Read
 //	doc, err := c.Get(ctx, "abc123")
+//
+//	// List all documents
+//	all, err := c.List(ctx)
 //
 //	// List with pagination
 //	page, err := c.List(ctx, collection.ListArgs{Limit: 10})
@@ -68,10 +105,15 @@
 //	// List with ID prefix filter
 //	userDocs, err := c.List(ctx, collection.ListArgs{Prefix: "user-"})
 //
+//	// Combine prefix, cursor, and limit
+//	page, err := c.List(ctx, collection.ListArgs{
+//	    Prefix: "user-", StartAfter: "user-alice", Limit: 20,
+//	})
+//
 //	// Delete
 //	c.Delete(ctx, "abc123")
 //
-// With a key prefix:
+// With a key prefix (useful for multi-tenant or namespaced stores):
 //
 //	c := collection.New[Todo](store, "todos", collection.WithPrefix("myapp/"))
 //	// Keys become: myapp/todos/%idx%abc123, myapp/todos/abc123/title, etc.
@@ -95,9 +137,13 @@ type fieldInfo struct {
 	index int    // struct field index for reflect.Value.Field()
 }
 
-// Document wraps a document value with its ID.
+// Document wraps a document value with its ID. It is the return type
+// for [Collection.List], providing the document ID alongside the
+// deserialized struct value.
 type Document[T any] struct {
-	ID    string
+	// ID is the document identifier (the string passed to Set/Get/Delete).
+	ID string
+	// Value is the deserialized struct with fields populated from store keys.
 	Value T
 }
 
@@ -130,6 +176,10 @@ func WithPrefix(p string) Option {
 
 // Collection manages documents of type T stored across individual field keys.
 // T must be a struct type with exported fields. Create with [New].
+//
+// A Collection is safe for concurrent use as long as the underlying store is
+// (all standard implementations are). The Collection itself holds no mutable
+// state — reflection metadata is computed once at construction time.
 type Collection[T any] struct {
 	store  storemd.Store
 	name   string
@@ -253,6 +303,12 @@ func (c *Collection[T]) Get(ctx context.Context, id string) (T, error) {
 // Set creates or updates a document. Every exported field of doc is written
 // as an individual store key, plus an index key for listing. Zero-value
 // fields are written too, so that clearing a field propagates via sync.
+//
+// Set is not atomic: each field is a separate write to the underlying store.
+// In the unlikely event of a partial failure (e.g. the store returns an error
+// mid-write), some fields may have been written while others were not. The
+// index key is always written first, so a partially-written document will
+// still appear in List results (with zero values for unwritten fields).
 func (c *Collection[T]) Set(ctx context.Context, id string, doc T) error {
 	// Write index key.
 	if err := c.store.Set(ctx, c.idxKey(id), "1"); err != nil {
@@ -276,6 +332,10 @@ func (c *Collection[T]) Set(ctx context.Context, id string, doc T) error {
 
 // Delete removes the index key and all field keys for the given document ID.
 // Returns [storemd.ErrNotFound] if the document does not exist.
+//
+// Like [Collection.Set], Delete is not atomic. The index key is removed first,
+// so the document will immediately stop appearing in [Collection.List] results
+// even if field key cleanup is still in progress.
 func (c *Collection[T]) Delete(ctx context.Context, id string) error {
 	// Check existence via index key.
 	_, err := c.store.Get(ctx, c.idxKey(id))
