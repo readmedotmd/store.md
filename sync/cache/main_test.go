@@ -9,30 +9,17 @@ import (
 
 	storemd "github.com/readmedotmd/store.md"
 	"github.com/readmedotmd/store.md/backend/memory"
-	"github.com/readmedotmd/store.md/sync/core"
 )
 
-// setup creates a StoreCache backed by an in-memory sync store. Both are
+// setup creates a StoreCache backed by an in-memory store. Both are
 // registered for cleanup via t.Cleanup. Returns the cache and the underlying
-// StoreSync for direct manipulation in tests. Accepts optional Option values.
-func setup(t *testing.T, opts ...Option) (*StoreCache, *core.StoreSync) {
+// store for direct manipulation in tests. Accepts optional Option values.
+func setup(t *testing.T, opts ...Option) (*StoreCache, storemd.Store) {
 	t.Helper()
 	mem := memory.New()
-	ss := core.New(mem)
-	t.Cleanup(func() { ss.Close() })
-	cached := New(ss, opts...)
+	cached := New(mem, opts...)
 	t.Cleanup(func() { cached.Close() })
-	return cached, ss
-}
-
-// setupDetached creates a StoreCache with the OnUpdate listener already
-// unsubscribed. This allows testing pure cache behavior without sync-driven
-// invalidation interfering. Accepts optional Option values.
-func setupDetached(t *testing.T, opts ...Option) (*StoreCache, *core.StoreSync) {
-	t.Helper()
-	cached, ss := setup(t, opts...)
-	cached.Close() // unsubscribe OnUpdate
-	return cached, ss
+	return cached, mem
 }
 
 // ---------------------------------------------------------------------------
@@ -40,10 +27,10 @@ func setupDetached(t *testing.T, opts ...Option) (*StoreCache, *core.StoreSync) 
 // ---------------------------------------------------------------------------
 
 func TestGet_PopulatesCache(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "k1", "v1")
+	mem.Set(ctx, "k1", "v1")
 
 	// First call: cache miss → hits underlying store.
 	v, err := cached.Get(ctx, "k1")
@@ -51,8 +38,8 @@ func TestGet_PopulatesCache(t *testing.T) {
 		t.Fatalf("expected v1, got %q err=%v", v, err)
 	}
 
-	// Mutate underlying directly (no invalidation since detached).
-	ss.Set(ctx, "k1", "changed")
+	// Mutate underlying directly (bypasses cache invalidation).
+	mem.Set(ctx, "k1", "changed")
 
 	// Second call: cache hit → returns stale value.
 	v, err = cached.Get(ctx, "k1")
@@ -62,7 +49,7 @@ func TestGet_PopulatesCache(t *testing.T) {
 }
 
 func TestGet_CachesNotFoundErrors(t *testing.T) {
-	cached, _ := setupDetached(t)
+	cached, _ := setup(t)
 	ctx := context.Background()
 
 	// First miss.
@@ -71,7 +58,7 @@ func TestGet_CachesNotFoundErrors(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 
-	// Second call should return the cached error without hitting the store.
+	// Second call should return the cached error.
 	_, err = cached.Get(ctx, "nonexistent")
 	if !errors.Is(err, storemd.ErrNotFound) {
 		t.Fatalf("expected cached ErrNotFound, got %v", err)
@@ -112,20 +99,6 @@ func TestSet_InvalidatesGetCache(t *testing.T) {
 	v, _ := cached.Get(ctx, "k1")
 	if v != "v2" {
 		t.Fatalf("expected v2 after Set, got %q", v)
-	}
-}
-
-func TestSet_InvalidatesGetItemCache(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	cached.SetItem(ctx, "app", "k1", "v1")
-	cached.GetItem(ctx, "k1") // populate
-
-	cached.Set(ctx, "k1", "v2")
-	item, err := cached.GetItem(ctx, "k1")
-	if err != nil || item.Value != "v2" {
-		t.Fatalf("expected v2, got %v err=%v", item, err)
 	}
 }
 
@@ -190,10 +163,10 @@ func TestSetIfNotExists_InvalidatesOnCreate(t *testing.T) {
 }
 
 func TestSetIfNotExists_NoInvalidateWhenKeyExists(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "k1", "original")
+	mem.Set(ctx, "k1", "original")
 	cached.Get(ctx, "k1") // populate cache
 
 	created, _ := cached.SetIfNotExists(ctx, "k1", "new")
@@ -227,45 +200,21 @@ func TestSetIfNotExists_InvalidatesNegativeCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SetItem invalidation
-// ---------------------------------------------------------------------------
-
-func TestSetItem_InvalidatesGetAndGetItem(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	cached.SetItem(ctx, "app", "k1", "v1")
-	cached.Get(ctx, "k1")
-	cached.GetItem(ctx, "k1")
-
-	cached.SetItem(ctx, "app", "k1", "v2")
-
-	v, _ := cached.Get(ctx, "k1")
-	if v != "v2" {
-		t.Fatalf("Get: expected v2, got %q", v)
-	}
-	item, _ := cached.GetItem(ctx, "k1")
-	if item.Value != "v2" {
-		t.Fatalf("GetItem: expected v2, got %q", item.Value)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // List caching
 // ---------------------------------------------------------------------------
 
 func TestList_CachesResult(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "a", "1")
-	ss.Set(ctx, "b", "2")
+	mem.Set(ctx, "a", "1")
+	mem.Set(ctx, "b", "2")
 
 	result, _ := cached.List(ctx, storemd.ListArgs{})
 	count := len(result)
 
 	// Add another via underlying (no invalidation).
-	ss.Set(ctx, "c", "3")
+	mem.Set(ctx, "c", "3")
 
 	// Should return stale result.
 	result2, _ := cached.List(ctx, storemd.ListArgs{})
@@ -330,18 +279,16 @@ func TestSet_InvalidatesListByPrefix(t *testing.T) {
 }
 
 func TestSet_DoesNotInvalidateUnrelatedList(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "users/1", "alice")
-
-	// Cache a list with prefix "users/"
+	mem.Set(ctx, "users/1", "alice")
 	cached.List(ctx, storemd.ListArgs{Prefix: "users/"})
 
-	// Write to a different prefix.
-	ss.Set(ctx, "orders/1", "order")
+	// Write to a different prefix via underlying (bypasses cache).
+	mem.Set(ctx, "orders/1", "order")
 
-	// "users/" cache should still be valid (detached, no OnUpdate).
+	// "users/" cache should still be valid.
 	cached.mu.RLock()
 	_, ok := cached.lists[listCacheKey(storemd.ListArgs{Prefix: "users/"})]
 	cached.mu.RUnlock()
@@ -351,11 +298,10 @@ func TestSet_DoesNotInvalidateUnrelatedList(t *testing.T) {
 }
 
 func TestSet_InvalidatesListContainingKey(t *testing.T) {
-	cached, _ := setupDetached(t)
+	cached, _ := setup(t)
 	ctx := context.Background()
 
-	// Populate a list that has an empty prefix (matches everything).
-	cached.ss.Set(ctx, "x", "1")
+	cached.store.Set(ctx, "x", "1")
 	cached.List(ctx, storemd.ListArgs{Prefix: "x"})
 
 	// Write to "x" — should invalidate because "x" has prefix "x".
@@ -370,136 +316,6 @@ func TestSet_InvalidatesListContainingKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ListItems caching
-// ---------------------------------------------------------------------------
-
-func TestListItems_CachesResult(t *testing.T) {
-	cached, ss := setupDetached(t)
-	ctx := context.Background()
-
-	ss.SetItem(ctx, "", "items/a", "1")
-	ss.SetItem(ctx, "", "items/b", "2")
-
-	items, err := cached.ListItems(ctx, "items/", "", 0)
-	if err != nil || len(items) != 2 {
-		t.Fatalf("expected 2 items, got %d err=%v", len(items), err)
-	}
-
-	ss.SetItem(ctx, "", "items/c", "3")
-
-	// Stale cache.
-	items, _ = cached.ListItems(ctx, "items/", "", 0)
-	if len(items) != 2 {
-		t.Fatalf("expected cached 2 items, got %d", len(items))
-	}
-}
-
-func TestSetItem_InvalidatesListItems(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	cached.SetItem(ctx, "", "ns/a", "1")
-	cached.ListItems(ctx, "ns/", "", 0) // populate
-
-	cached.SetItem(ctx, "", "ns/b", "2")
-
-	items, _ := cached.ListItems(ctx, "ns/", "", 0)
-	if len(items) != 2 {
-		t.Fatalf("expected 2, got %d", len(items))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// GetItem caching
-// ---------------------------------------------------------------------------
-
-func TestGetItem_CachesResult(t *testing.T) {
-	cached, ss := setupDetached(t)
-	ctx := context.Background()
-
-	ss.SetItem(ctx, "app", "k1", "v1")
-
-	item, err := cached.GetItem(ctx, "k1")
-	if err != nil || item.Value != "v1" {
-		t.Fatalf("expected v1, got %v err=%v", item, err)
-	}
-
-	ss.SetItem(ctx, "app", "k1", "v2")
-
-	// Stale cache.
-	item, _ = cached.GetItem(ctx, "k1")
-	if item.Value != "v1" {
-		t.Fatalf("expected cached v1, got %q", item.Value)
-	}
-}
-
-func TestGetItem_CachesNotFound(t *testing.T) {
-	cached, _ := setupDetached(t)
-	ctx := context.Background()
-
-	_, err := cached.GetItem(ctx, "missing")
-	if !errors.Is(err, storemd.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-
-	_, err = cached.GetItem(ctx, "missing")
-	if !errors.Is(err, storemd.ErrNotFound) {
-		t.Fatalf("expected cached ErrNotFound, got %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// OnUpdate / sync-driven invalidation
-// ---------------------------------------------------------------------------
-
-func TestOnUpdate_InvalidatesGetCache(t *testing.T) {
-	cached, ss := setup(t)
-	ctx := context.Background()
-
-	cached.Set(ctx, "k1", "v1")
-	cached.Get(ctx, "k1") // populate
-
-	// Write directly to underlying — triggers OnUpdate → invalidation.
-	ss.Set(ctx, "k1", "v2")
-
-	v, _ := cached.Get(ctx, "k1")
-	if v != "v2" {
-		t.Fatalf("expected v2 after sync update, got %q", v)
-	}
-}
-
-func TestOnUpdate_InvalidatesGetItemCache(t *testing.T) {
-	cached, ss := setup(t)
-	ctx := context.Background()
-
-	cached.SetItem(ctx, "app", "k1", "v1")
-	cached.GetItem(ctx, "k1") // populate
-
-	ss.SetItem(ctx, "app", "k1", "v2")
-
-	item, _ := cached.GetItem(ctx, "k1")
-	if item.Value != "v2" {
-		t.Fatalf("expected v2, got %q", item.Value)
-	}
-}
-
-func TestOnUpdate_InvalidatesListCache(t *testing.T) {
-	cached, ss := setup(t)
-	ctx := context.Background()
-
-	cached.Set(ctx, "ns/a", "1")
-	cached.List(ctx, storemd.ListArgs{Prefix: "ns/"}) // populate
-
-	// Remote write
-	ss.Set(ctx, "ns/b", "2")
-
-	result, _ := cached.List(ctx, storemd.ListArgs{Prefix: "ns/"})
-	if len(result) != 2 {
-		t.Fatalf("expected 2 after sync, got %d", len(result))
-	}
-}
-
-// ---------------------------------------------------------------------------
 // InvalidateAll
 // ---------------------------------------------------------------------------
 
@@ -509,31 +325,26 @@ func TestInvalidateAll_ClearsAllMaps(t *testing.T) {
 
 	cached.Set(ctx, "k1", "v1")
 	cached.Get(ctx, "k1")
-	cached.GetItem(ctx, "k1")
 	cached.Set(ctx, "ns/a", "1")
 	cached.List(ctx, storemd.ListArgs{Prefix: "ns/"})
-	cached.ListItems(ctx, "ns/", "", 0)
 
 	cached.InvalidateAll()
 
 	cached.mu.RLock()
 	gLen := len(cached.gets)
-	giLen := len(cached.getItems)
 	lLen := len(cached.lists)
-	liLen := len(cached.listKeys)
 	cached.mu.RUnlock()
 
-	if gLen != 0 || giLen != 0 || lLen != 0 || liLen != 0 {
-		t.Fatalf("expected all maps empty, got gets=%d getItems=%d lists=%d listKeys=%d",
-			gLen, giLen, lLen, liLen)
+	if gLen != 0 || lLen != 0 {
+		t.Fatalf("expected all maps empty, got gets=%d lists=%d", gLen, lLen)
 	}
 }
 
 func TestInvalidateAll_SubsequentGetHitsStore(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "k1", "v1")
+	mem.Set(ctx, "k1", "v1")
 	cached.Get(ctx, "k1") // populate
 
 	// Still stale.
@@ -560,21 +371,21 @@ func TestInvalidateAll_SubsequentGetHitsStore(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// InvalidateKey (manual)
+// InvalidateKey (manual / external)
 // ---------------------------------------------------------------------------
 
 func TestInvalidateKey_EvictsSpecificKey(t *testing.T) {
-	cached, ss := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	ss.Set(ctx, "k1", "v1")
-	ss.Set(ctx, "k2", "v2")
+	mem.Set(ctx, "k1", "v1")
+	mem.Set(ctx, "k2", "v2")
 	cached.Get(ctx, "k1")
 	cached.Get(ctx, "k2")
 
-	ss.Set(ctx, "k1", "changed")
+	mem.Set(ctx, "k1", "changed")
 
-	// k1 stale, k2 stale.
+	// k1 stale.
 	v, _ := cached.Get(ctx, "k1")
 	if v != "v1" {
 		t.Fatalf("expected stale v1, got %q", v)
@@ -594,14 +405,32 @@ func TestInvalidateKey_EvictsSpecificKey(t *testing.T) {
 	}
 }
 
+func TestInvalidateKey_EvictsMatchingLists(t *testing.T) {
+	cached, _ := setup(t)
+	ctx := context.Background()
+
+	cached.Set(ctx, "ns/a", "1")
+	cached.List(ctx, storemd.ListArgs{Prefix: "ns/"})
+
+	cached.InvalidateKey("ns/b")
+
+	cached.mu.RLock()
+	_, ok := cached.lists[listCacheKey(storemd.ListArgs{Prefix: "ns/"})]
+	cached.mu.RUnlock()
+	if ok {
+		t.Fatal("list should have been invalidated by InvalidateKey")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Unwrap
 // ---------------------------------------------------------------------------
 
 func TestUnwrap_ReturnsSameStore(t *testing.T) {
-	cached, ss := setup(t)
-	if cached.Unwrap() != core.SyncStore(ss) {
-		t.Fatal("Unwrap should return the underlying SyncStore")
+	mem := memory.New()
+	cached := New(mem)
+	if cached.Unwrap() != storemd.Store(mem) {
+		t.Fatal("Unwrap should return the underlying Store")
 	}
 }
 
@@ -612,7 +441,6 @@ func TestUnwrap_BypassesCache(t *testing.T) {
 	cached.Set(ctx, "k1", "v1")
 	cached.Get(ctx, "k1") // populate
 
-	// Read through Unwrap — should not affect cache.
 	v, _ := cached.Unwrap().Get(ctx, "k1")
 	if v != "v1" {
 		t.Fatalf("expected v1 from Unwrap, got %q", v)
@@ -620,49 +448,8 @@ func TestUnwrap_BypassesCache(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Close behavior
+// Close
 // ---------------------------------------------------------------------------
-
-func TestClose_StopsAutoInvalidation(t *testing.T) {
-	cached, ss := setup(t)
-	ctx := context.Background()
-
-	cached.Set(ctx, "k1", "v1")
-	cached.Get(ctx, "k1") // populate
-
-	cached.Close()
-
-	// Write to underlying — OnUpdate no longer fires.
-	ss.Set(ctx, "k1", "v2")
-
-	// Should return stale value.
-	v, _ := cached.Get(ctx, "k1")
-	if v != "v1" {
-		t.Fatalf("expected stale v1 after Close, got %q", v)
-	}
-}
-
-func TestClose_LocalWritesStillInvalidate(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	cached.Set(ctx, "k1", "v1")
-	cached.Get(ctx, "k1") // populate
-
-	cached.Close()
-
-	// Write through cache wrapper — explicit invalidation in Set still works.
-	cached.Set(ctx, "k1", "v2")
-
-	// The get cache entry for "k1" should have been evicted by Set's
-	// invalidateKey call, even though OnUpdate is no longer active.
-	cached.mu.RLock()
-	_, ok := cached.gets["k1"]
-	cached.mu.RUnlock()
-	if ok {
-		t.Fatal("expected k1 to be evicted from get cache after Set")
-	}
-}
 
 func TestClose_Idempotent(t *testing.T) {
 	cached, _ := setup(t)
@@ -675,45 +462,11 @@ func TestClose_Idempotent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Sync pass-through
-// ---------------------------------------------------------------------------
-
-func TestSync_Delegates(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	_, err := cached.Sync(ctx, "peer1", nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// OnUpdate pass-through
-// ---------------------------------------------------------------------------
-
-func TestOnUpdate_DelegatesToUnderlying(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	var got core.SyncStoreItem
-	unsub := cached.OnUpdate(func(item core.SyncStoreItem) {
-		got = item
-	})
-	defer unsub()
-
-	cached.Set(ctx, "k1", "v1")
-	if got.Key != "k1" {
-		t.Fatalf("expected OnUpdate with key k1, got %q", got.Key)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Interface compliance
 // ---------------------------------------------------------------------------
 
-func TestImplementsSyncStore(t *testing.T) {
-	var _ core.SyncStore = (*StoreCache)(nil)
+func TestImplementsStore(t *testing.T) {
+	var _ storemd.Store = (*StoreCache)(nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -729,9 +482,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 200)
 
-	// 100 concurrent readers — NOT_FOUND is acceptable because concurrent
-	// writers go through the sync layer which briefly tombstones during
-	// conflict resolution.
+	// 100 concurrent readers.
 	for range 100 {
 		wg.Add(1)
 		go func() {
@@ -770,7 +521,6 @@ func TestConcurrentListAndWrite(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Concurrent list readers.
 	for range 50 {
 		wg.Add(1)
 		go func() {
@@ -779,7 +529,6 @@ func TestConcurrentListAndWrite(t *testing.T) {
 		}()
 	}
 
-	// Concurrent writers that invalidate the list.
 	for i := range 50 {
 		wg.Add(1)
 		go func(i int) {
@@ -799,13 +548,10 @@ func TestList_EmptyPrefixInvalidatedByAnyWrite(t *testing.T) {
 	cached, _ := setup(t)
 	ctx := context.Background()
 
-	// Cache a list with empty prefix (matches everything).
 	cached.List(ctx, storemd.ListArgs{})
 
 	cached.Set(ctx, "anything", "v")
 
-	// The empty-prefix list should be invalidated because "anything"
-	// has prefix "" (everything does).
 	cached.mu.RLock()
 	_, ok := cached.lists[listCacheKey(storemd.ListArgs{})]
 	cached.mu.RUnlock()
@@ -815,12 +561,10 @@ func TestList_EmptyPrefixInvalidatedByAnyWrite(t *testing.T) {
 }
 
 func TestList_NestedPrefixInvalidation(t *testing.T) {
-	// Use detached setup to avoid OnUpdate firing from intermediate Set calls
-	// which would make it hard to reason about which lists get invalidated.
-	cached, _ := setupDetached(t)
+	cached, mem := setup(t)
 	ctx := context.Background()
 
-	cached.ss.Set(ctx, "a/b/c", "1")
+	mem.Set(ctx, "a/b/c", "1")
 
 	// Cache lists at different prefix depths.
 	cached.List(ctx, storemd.ListArgs{Prefix: "a/"})
@@ -849,22 +593,6 @@ func TestList_NestedPrefixInvalidation(t *testing.T) {
 	}
 }
 
-func TestDelete_InvalidatesListItems(t *testing.T) {
-	cached, _ := setup(t)
-	ctx := context.Background()
-
-	cached.SetItem(ctx, "", "ns/a", "1")
-	cached.SetItem(ctx, "", "ns/b", "2")
-	cached.ListItems(ctx, "ns/", "", 0) // populate
-
-	cached.Delete(ctx, "ns/a")
-
-	items, _ := cached.ListItems(ctx, "ns/", "", 0)
-	if len(items) != 1 {
-		t.Fatalf("expected 1 after delete, got %d", len(items))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // MaxSize and eviction
 // ---------------------------------------------------------------------------
@@ -884,13 +612,12 @@ func TestWithMaxSize_CustomValue(t *testing.T) {
 }
 
 func TestWithMaxSize_Zero_Unbounded(t *testing.T) {
-	cached, _ := setupDetached(t, WithMaxSize(0))
+	cached, _ := setup(t, WithMaxSize(0))
 	ctx := context.Background()
 
-	// Fill well beyond the default — should never evict.
 	const count = 1500
 	for i := range count {
-		cached.ss.Set(ctx, fmt.Sprintf("k%d", i), "v")
+		cached.store.Set(ctx, fmt.Sprintf("k%d", i), "v")
 	}
 	for i := range count {
 		cached.Get(ctx, fmt.Sprintf("k%d", i))
@@ -905,12 +632,11 @@ func TestWithMaxSize_Zero_Unbounded(t *testing.T) {
 }
 
 func TestGet_EvictsWhenAtCapacity(t *testing.T) {
-	cached, _ := setupDetached(t, WithMaxSize(3))
+	cached, _ := setup(t, WithMaxSize(3))
 	ctx := context.Background()
 
-	// Populate underlying store with 5 keys.
 	for i := range 5 {
-		cached.ss.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		cached.store.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 	}
 
 	// Cache 3 entries to reach capacity.
@@ -933,36 +659,13 @@ func TestGet_EvictsWhenAtCapacity(t *testing.T) {
 	}
 }
 
-func TestGetItem_EvictsWhenAtCapacity(t *testing.T) {
-	cached, _ := setupDetached(t, WithMaxSize(2))
-	ctx := context.Background()
-
-	for i := range 4 {
-		cached.ss.SetItem(ctx, "", fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
-	}
-
-	// Fill to capacity.
-	cached.GetItem(ctx, "k0")
-	cached.GetItem(ctx, "k1")
-
-	// One more — evicts one, stays at 2.
-	cached.GetItem(ctx, "k2")
-	cached.mu.RLock()
-	n := len(cached.getItems)
-	cached.mu.RUnlock()
-	if n != 2 {
-		t.Fatalf("expected 2 after eviction, got %d", n)
-	}
-}
-
 func TestList_EvictsWhenAtCapacity(t *testing.T) {
-	cached, _ := setupDetached(t, WithMaxSize(2))
+	cached, _ := setup(t, WithMaxSize(2))
 	ctx := context.Background()
 
-	cached.ss.Set(ctx, "a/1", "v")
-	cached.ss.Set(ctx, "b/1", "v")
-	cached.ss.Set(ctx, "c/1", "v")
-	cached.ss.Set(ctx, "d/1", "v")
+	cached.store.Set(ctx, "a/1", "v")
+	cached.store.Set(ctx, "b/1", "v")
+	cached.store.Set(ctx, "c/1", "v")
 
 	// Fill to capacity with 2 different list queries.
 	cached.List(ctx, storemd.ListArgs{Prefix: "a/"})
@@ -984,34 +687,12 @@ func TestList_EvictsWhenAtCapacity(t *testing.T) {
 	}
 }
 
-func TestListItems_EvictsWhenAtCapacity(t *testing.T) {
-	cached, _ := setupDetached(t, WithMaxSize(2))
-	ctx := context.Background()
-
-	cached.ss.SetItem(ctx, "", "a/1", "v")
-	cached.ss.SetItem(ctx, "", "b/1", "v")
-	cached.ss.SetItem(ctx, "", "c/1", "v")
-
-	cached.ListItems(ctx, "a/", "", 0)
-	cached.ListItems(ctx, "b/", "", 0)
-
-	// Third — evicts one, stays at 2.
-	cached.ListItems(ctx, "c/", "", 0)
-	cached.mu.RLock()
-	n := len(cached.listKeys)
-	cached.mu.RUnlock()
-	if n != 2 {
-		t.Fatalf("expected 2 after eviction, got %d", n)
-	}
-}
-
 func TestEviction_DoesNotLoseNewEntry(t *testing.T) {
-	// After eviction the newly inserted entry must be present.
-	cached, _ := setupDetached(t, WithMaxSize(1))
+	cached, _ := setup(t, WithMaxSize(1))
 	ctx := context.Background()
 
-	cached.ss.Set(ctx, "k0", "v0")
-	cached.ss.Set(ctx, "k1", "v1")
+	cached.store.Set(ctx, "k0", "v0")
+	cached.store.Set(ctx, "k1", "v1")
 
 	cached.Get(ctx, "k0") // fills the single slot
 
@@ -1021,7 +702,6 @@ func TestEviction_DoesNotLoseNewEntry(t *testing.T) {
 		t.Fatalf("expected v1, got %q err=%v", v, err)
 	}
 
-	// k1 must be cached.
 	cached.mu.RLock()
 	_, ok := cached.gets["k1"]
 	cached.mu.RUnlock()
@@ -1031,13 +711,11 @@ func TestEviction_DoesNotLoseNewEntry(t *testing.T) {
 }
 
 func TestEviction_MaxSizeOneStillWorks(t *testing.T) {
-	// Edge case: maxSize=1 means the cache always holds at most one entry
-	// per map, constantly evicting on every new insert.
-	cached, _ := setupDetached(t, WithMaxSize(1))
+	cached, _ := setup(t, WithMaxSize(1))
 	ctx := context.Background()
 
 	for i := range 10 {
-		cached.ss.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		cached.store.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 	}
 
 	for i := range 10 {
@@ -1047,7 +725,6 @@ func TestEviction_MaxSizeOneStillWorks(t *testing.T) {
 		}
 	}
 
-	// Cache should have exactly 1 entry (the last one read).
 	cached.mu.RLock()
 	n := len(cached.gets)
 	cached.mu.RUnlock()
@@ -1057,12 +734,11 @@ func TestEviction_MaxSizeOneStillWorks(t *testing.T) {
 }
 
 func TestEviction_InvalidationReducesSizeBelowMax(t *testing.T) {
-	// After invalidation frees space, the next insert should not evict.
-	cached, _ := setupDetached(t, WithMaxSize(3))
+	cached, _ := setup(t, WithMaxSize(3))
 	ctx := context.Background()
 
 	for i := range 3 {
-		cached.ss.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		cached.store.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 		cached.Get(ctx, fmt.Sprintf("k%d", i))
 	}
 
@@ -1077,7 +753,7 @@ func TestEviction_InvalidationReducesSizeBelowMax(t *testing.T) {
 	}
 
 	// Insert a new key — should not evict since size < max.
-	cached.ss.Set(ctx, "k3", "v3")
+	cached.store.Set(ctx, "k3", "v3")
 	cached.Get(ctx, "k3")
 
 	cached.mu.RLock()
@@ -1089,13 +765,11 @@ func TestEviction_InvalidationReducesSizeBelowMax(t *testing.T) {
 }
 
 func TestConcurrentEviction(t *testing.T) {
-	// Verify no panics or data races under concurrent access with a small cache.
 	cached, _ := setup(t, WithMaxSize(5))
 	ctx := context.Background()
 
-	// Pre-populate store with many keys.
 	for i := range 100 {
-		cached.ss.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+		cached.store.Set(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
 	}
 
 	var wg sync.WaitGroup
@@ -1108,11 +782,32 @@ func TestConcurrentEviction(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Cache should not exceed maxSize.
 	cached.mu.RLock()
 	n := len(cached.gets)
 	cached.mu.RUnlock()
 	if n > 5 {
 		t.Fatalf("expected at most 5 entries, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sync integration (external invalidation)
+// ---------------------------------------------------------------------------
+
+func TestInvalidateKey_WorksForExternalSyncInvalidation(t *testing.T) {
+	// Demonstrates the pattern: sync store OnUpdate → InvalidateKey.
+	cached, mem := setup(t)
+	ctx := context.Background()
+
+	mem.Set(ctx, "k1", "v1")
+	cached.Get(ctx, "k1") // populate
+
+	// Simulate external write + InvalidateKey (what OnUpdate would do).
+	mem.Set(ctx, "k1", "v2")
+	cached.InvalidateKey("k1")
+
+	v, _ := cached.Get(ctx, "k1")
+	if v != "v2" {
+		t.Fatalf("expected v2 after external invalidation, got %q", v)
 	}
 }
