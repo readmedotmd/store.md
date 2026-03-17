@@ -2,8 +2,10 @@ package client_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	gosync "sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -435,5 +437,237 @@ func TestNoSyncLoop_TwoClients(t *testing.T) {
 	if finalB-snapshotB > 2 {
 		t.Errorf("sync loop detected on Client B: %d messages sent after settling (snapshot=%d, final=%d)",
 			finalB-snapshotB, snapshotB, finalB)
+	}
+}
+
+// breakableConn wraps a Connection and allows force-closing it to simulate
+// a network failure. This is needed because httptest.Server.Close() does not
+// immediately close hijacked WebSocket connections.
+type breakableConn struct {
+	client.Connection
+	done chan struct{}
+	once gosync.Once
+}
+
+func newBreakableConn(c client.Connection) *breakableConn {
+	return &breakableConn{Connection: c, done: make(chan struct{})}
+}
+
+func (b *breakableConn) Break() {
+	b.once.Do(func() { close(b.done) })
+	b.Connection.Close()
+}
+
+func (b *breakableConn) ReadMessage() (client.Message, error) {
+	select {
+	case <-b.done:
+		return client.Message{}, fmt.Errorf("connection broken")
+	default:
+		return b.Connection.ReadMessage()
+	}
+}
+
+func TestClient_Reconnect_StaysAlive(t *testing.T) {
+	ctx := context.Background()
+	serverStore := newSyncStore(t)
+
+	if err := serverStore.SetItem(ctx, "app", "key1", "val1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var activeConn atomic.Pointer[breakableConn]
+	var dialCount atomic.Int64
+
+	tokens := map[string]string{"test-token": "test-peer"}
+	srv := server.New(serverStore, server.TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			n := dialCount.Add(1)
+			conn, err := client.Dial(peerID, url, header)
+			if err != nil {
+				return nil, err
+			}
+			bc := newBreakableConn(conn)
+			if n == 1 {
+				activeConn.Store(bc)
+			}
+			return bc, nil
+		}),
+	)
+	defer c.Close()
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync.
+	time.Sleep(300 * time.Millisecond)
+
+	v, err := clientStore.Get(ctx, "key1")
+	if err != nil {
+		t.Fatalf("Get key1: %v", err)
+	}
+	if v != "val1" {
+		t.Fatalf("expected val1, got %q", v)
+	}
+
+	// Break the connection.
+	activeConn.Load().Break()
+
+	// Wait for reconnection.
+	deadline := time.After(3 * time.Second)
+	for dialCount.Load() <= 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected reconnection, got %d dials", dialCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Client should still be alive.
+	if c.Closed() {
+		t.Fatal("client should not be closed while reconnecting")
+	}
+}
+
+func TestClient_Reconnect_BackoffRetries(t *testing.T) {
+	var dialCount atomic.Int64
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			n := dialCount.Add(1)
+			if n == 1 {
+				// First dial succeeds with a connection that immediately errors.
+				conn, err := client.Dial(peerID, url, header)
+				if err != nil {
+					return nil, err
+				}
+				bc := newBreakableConn(conn)
+				// Break immediately to trigger reconnect.
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					bc.Break()
+				}()
+				return bc, nil
+			}
+			// Subsequent dials fail.
+			return nil, fmt.Errorf("simulated dial failure")
+		}),
+	)
+	defer c.Close()
+
+	// Start a real server just for the first connection.
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+	defer ts.Close()
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for multiple reconnection attempts.
+	deadline := time.After(3 * time.Second)
+	for dialCount.Load() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected at least 3 dial attempts, got %d", dialCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Client should still be alive, retrying.
+	if c.Closed() {
+		t.Fatal("client should not be closed while reconnecting")
+	}
+
+	// Explicit close should stop reconnection.
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !c.Closed() {
+		t.Fatal("client should be closed after Close()")
+	}
+}
+
+func TestClient_NoReconnect_WithoutOption(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+
+	var activeConn atomic.Pointer[breakableConn]
+	// No WithReconnect option — should auto-close when connection drops.
+	c := client.New(clientStore, client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+		conn, err := client.Dial(peerID, url, header)
+		if err != nil {
+			return nil, err
+		}
+		bc := newBreakableConn(conn)
+		activeConn.Store(bc)
+		return bc, nil
+	}))
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Break the connection.
+	activeConn.Load().Break()
+
+	// Wait for client to detect disconnect and auto-close.
+	deadline := time.After(3 * time.Second)
+	for !c.Closed() {
+		select {
+		case <-deadline:
+			t.Fatal("client should auto-close without WithReconnect")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func TestClient_Reconnect_ServerSideConnNoReconnect(t *testing.T) {
+	// Server-side connections (via AddConnection) should NOT reconnect.
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.WithReconnect(50*time.Millisecond, 200*time.Millisecond))
+
+	conn, err := client.Dial("test-peer", wsURL(ts), authHeader("test-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc := newBreakableConn(conn)
+	if err := c.AddConnection(bc); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Break the connection.
+	bc.Break()
+
+	// Server-side connections should not reconnect, so client should auto-close.
+	deadline := time.After(3 * time.Second)
+	for !c.Closed() {
+		select {
+		case <-deadline:
+			t.Fatal("client should auto-close for server-side connections even with WithReconnect")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 }

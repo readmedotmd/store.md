@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	gosync "sync"
+	"time"
 
 	storesync "github.com/readmedotmd/store.md/sync/core"
 )
@@ -32,6 +34,17 @@ type managedConn struct {
 	mu     gosync.Mutex // serializes writes
 	done   chan struct{}
 	active bool // true for client-side connections that initiate sync
+
+	// dialInfo stores the parameters needed to redial this connection.
+	// Non-nil only for active connections created via Connect.
+	dialInfo *dialInfo
+}
+
+// dialInfo stores the parameters needed to redial a connection.
+type dialInfo struct {
+	peerID string
+	url    string
+	header http.Header
 }
 
 // Client is a sync adapter that connects a local SyncStore to one or more
@@ -62,6 +75,13 @@ type Client struct {
 	// push cycle, avoiding 2 goroutines per update.
 	notifyCh chan struct{}
 
+	// Reconnection settings.
+	reconnect        bool
+	reconnectInitial time.Duration
+	reconnectMax     time.Duration
+	pendingReconnMu  gosync.Mutex
+	pendingReconn    int
+
 	wg     gosync.WaitGroup // tracks all background goroutines
 	done   chan struct{}
 	unsub  func()
@@ -82,15 +102,34 @@ func WithMaxConns(n int) Option {
 	return func(c *Client) { c.maxConns = n }
 }
 
+// WithReconnect enables automatic reconnection for client-initiated connections
+// (those created via Connect). When a connection drops unexpectedly, the client
+// will attempt to redial with exponential backoff starting at initialBackoff and
+// capping at maxBackoff. Reconnection continues until the client is closed.
+// Defaults: initialBackoff=1s, maxBackoff=30s if zero values are passed.
+func WithReconnect(initialBackoff, maxBackoff time.Duration) Option {
+	return func(c *Client) {
+		c.reconnect = true
+		if initialBackoff > 0 {
+			c.reconnectInitial = initialBackoff
+		}
+		if maxBackoff > 0 {
+			c.reconnectMax = maxBackoff
+		}
+	}
+}
+
 // New creates a Client that syncs the given store over connections.
 func New(store storesync.SyncStore, opts ...Option) *Client {
 	c := &Client{
-		store:    store,
-		logger:   slog.Default(),
-		dialer:   Dial,
-		maxConns: 100,
-		done:     make(chan struct{}),
-		notifyCh: make(chan struct{}, 1),
+		store:            store,
+		logger:           slog.Default(),
+		dialer:           Dial,
+		maxConns:         100,
+		reconnectInitial: 1 * time.Second,
+		reconnectMax:     30 * time.Second,
+		done:             make(chan struct{}),
+		notifyCh:         make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(c)
@@ -150,17 +189,25 @@ func (c *Client) Connect(peerID, url string, header http.Header) error {
 	if err != nil {
 		return err
 	}
-	return c.addConn(conn, true)
+	var di *dialInfo
+	if c.reconnect {
+		h := make(http.Header)
+		for k, v := range header {
+			h[k] = v
+		}
+		di = &dialInfo{peerID: peerID, url: url, header: h}
+	}
+	return c.addConn(conn, true, di)
 }
 
 // AddConnection adds an existing Connection (e.g. a server-side accepted
 // WebSocket) and starts handling sync messages over it. The connection is
 // passive: it responds to incoming sync messages but does not initiate.
 func (c *Client) AddConnection(conn Connection) error {
-	return c.addConn(conn, false)
+	return c.addConn(conn, false, nil)
 }
 
-func (c *Client) addConn(conn Connection, active bool) error {
+func (c *Client) addConn(conn Connection, active bool, di *dialInfo) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -179,6 +226,7 @@ func (c *Client) addConn(conn Connection, active bool) error {
 		Connection: conn,
 		done:       make(chan struct{}),
 		active:     active,
+		dialInfo:   di,
 	}
 
 	c.connsMu.Lock()
@@ -213,8 +261,70 @@ func (c *Client) removeConn(mc *managedConn) {
 	remaining := len(c.conns)
 	c.connsMu.Unlock()
 
-	if remaining == 0 {
+	c.pendingReconnMu.Lock()
+	pending := c.pendingReconn
+	c.pendingReconnMu.Unlock()
+
+	if remaining == 0 && pending == 0 {
 		c.Close()
+	}
+}
+
+// reconnectLoop attempts to re-establish a dropped connection with
+// exponential backoff. It retries until the client is closed.
+func (c *Client) reconnectLoop(di *dialInfo) {
+	defer func() {
+		c.pendingReconnMu.Lock()
+		c.pendingReconn--
+		pending := c.pendingReconn
+		c.pendingReconnMu.Unlock()
+
+		// If we gave up (client closing) and nothing else is left, close.
+		c.connsMu.RLock()
+		remaining := len(c.conns)
+		c.connsMu.RUnlock()
+		if remaining == 0 && pending == 0 {
+			c.Close()
+		}
+	}()
+
+	backoff := c.reconnectInitial
+	attempt := 0
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		c.logger.Info("reconnecting", "peer", di.peerID, "attempt", attempt+1, "backoff", backoff)
+
+		conn, err := c.dialer(di.peerID, di.url, di.header)
+		if err != nil {
+			c.logger.Error("reconnect dial failed", "peer", di.peerID, "err", err)
+			attempt++
+
+			select {
+			case <-c.done:
+				return
+			case <-time.After(backoff):
+			}
+
+			// Exponential backoff with cap.
+			backoff = time.Duration(float64(c.reconnectInitial) * math.Pow(2, float64(attempt)))
+			if backoff > c.reconnectMax {
+				backoff = c.reconnectMax
+			}
+			continue
+		}
+
+		c.logger.Info("reconnected", "peer", di.peerID, "attempts", attempt+1)
+		if err := c.addConn(conn, true, di); err != nil {
+			c.logger.Error("reconnect addConn failed", "peer", di.peerID, "err", err)
+			conn.Close()
+			return
+		}
+		return
 	}
 }
 
@@ -301,7 +411,32 @@ func (c *Client) pushToAll(sender *managedConn) {
 
 // readLoop reads messages from a connection and handles them.
 func (c *Client) readLoop(mc *managedConn) {
-	defer c.removeConn(mc)
+	defer func() {
+		shouldReconnect := false
+		if mc.dialInfo != nil {
+			// Only reconnect if the drop was unexpected (not explicit close).
+			select {
+			case <-c.done:
+			case <-mc.done:
+			default:
+				shouldReconnect = true
+			}
+		}
+		if shouldReconnect {
+			// Increment before removeConn so auto-close doesn't fire.
+			c.pendingReconnMu.Lock()
+			c.pendingReconn++
+			c.pendingReconnMu.Unlock()
+		}
+		c.removeConn(mc)
+		if shouldReconnect {
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				c.reconnectLoop(mc.dialInfo)
+			}()
+		}
+	}()
 	ctx := context.Background()
 	for {
 		msg, err := mc.ReadMessage()
