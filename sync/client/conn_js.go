@@ -124,8 +124,9 @@ func Dial(peerID, url string, header http.Header) (Connection, error) {
 	})
 
 	conn.onClose = js.FuncOf(func(this js.Value, args []js.Value) any {
+		closeErr := closeError(args)
 		select {
-		case conn.errCh <- fmt.Errorf("websocket closed"):
+		case conn.errCh <- closeErr:
 		default:
 		}
 		return nil
@@ -146,4 +147,18 @@ func Dial(peerID, url string, header http.Header) (Connection, error) {
 		conn.release()
 		return nil, fmt.Errorf("dial: %w", err)
 	}
+}
+
+// closeError inspects the CloseEvent's code and returns ErrAuthFailed for
+// auth-related close codes (4401, 1008), so OnConnectError hooks can
+// distinguish auth failures from transient network errors.
+func closeError(args []js.Value) error {
+	if len(args) > 0 {
+		code := args[0].Get("code").Int()
+		if code == 4401 || code == 1008 {
+			return fmt.Errorf("websocket closed (code %d): %w", code, ErrAuthFailed)
+		}
+		return fmt.Errorf("websocket closed (code %d)", code)
+	}
+	return fmt.Errorf("websocket closed")
 }

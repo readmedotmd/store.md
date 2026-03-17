@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -11,6 +12,12 @@ import (
 
 	storesync "github.com/readmedotmd/store.md/sync/core"
 )
+
+// ErrAuthFailed is returned when a WebSocket connection is closed with a
+// close code indicating authentication failure (4401 or 1008). OnConnectError
+// hooks can check for this error with errors.Is to distinguish auth failures
+// from transient network errors and stop retrying.
+var ErrAuthFailed = errors.New("authentication failed")
 
 // Message is the wire format for sync protocol messages.
 type Message struct {
