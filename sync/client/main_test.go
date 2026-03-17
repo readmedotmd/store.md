@@ -848,3 +848,165 @@ func TestClient_HeaderProvider(t *testing.T) {
 		}
 	}
 }
+
+// --- Interceptor behavior tests ---
+
+func TestClient_OnConnect_RejectsConnection(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.OnConnect(func(peerID string) error {
+		return fmt.Errorf("rejected: %s not allowed", peerID)
+	}))
+	defer c.Close()
+
+	err := c.Connect("client-peer", wsURL(ts), authHeader("test-token"))
+	if err == nil {
+		t.Fatal("expected Connect to fail when OnConnect rejects")
+	}
+	if err.Error() != "onConnect rejected: rejected: client-peer not allowed" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClient_OnDisconnect_SuppressesReconnect(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	var dialCount atomic.Int64
+	var activeConn atomic.Pointer[breakableConn]
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.OnDisconnect(func(peerID string, err error) bool {
+			return false // suppress reconnection
+		}),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			dialCount.Add(1)
+			conn, err := client.Dial(peerID, url, header)
+			if err != nil {
+				return nil, err
+			}
+			bc := newBreakableConn(conn)
+			activeConn.Store(bc)
+			return bc, nil
+		}),
+	)
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Break the connection — reconnect should be suppressed.
+	activeConn.Load().Break()
+
+	// Client should auto-close because OnDisconnect returned false,
+	// which suppresses reconnection.
+	deadline := time.After(3 * time.Second)
+	for !c.Closed() {
+		select {
+		case <-deadline:
+			t.Fatal("client should auto-close when OnDisconnect suppresses reconnect")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// Should have only dialed once — no reconnection attempt.
+	if dialCount.Load() != 1 {
+		t.Fatalf("expected 1 dial (no reconnect), got %d", dialCount.Load())
+	}
+}
+
+func TestClient_OnConnectError_StopsRetrying(t *testing.T) {
+	var dialCount atomic.Int64
+	var errorCount atomic.Int64
+
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.OnConnectError(func(peerID string, err error) bool {
+			n := errorCount.Add(1)
+			// Allow 2 retries, then give up.
+			return n < 3
+		}),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			n := dialCount.Add(1)
+			if n == 1 {
+				conn, err := client.Dial(peerID, url, header)
+				if err != nil {
+					return nil, err
+				}
+				bc := newBreakableConn(conn)
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					bc.Break()
+				}()
+				return bc, nil
+			}
+			return nil, fmt.Errorf("simulated dial failure")
+		}),
+	)
+	defer c.Close()
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for reconnection to give up.
+	deadline := time.After(5 * time.Second)
+	for errorCount.Load() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected 3 connect errors, got %d", errorCount.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	// After the hook returns false, retries should stop. Wait a bit and
+	// verify the dial count hasn't grown beyond the initial + 3 retries.
+	time.Sleep(500 * time.Millisecond)
+	// 1 initial + ~3 reconnect attempts (the 3rd error stops retries)
+	if dialCount.Load() > 5 {
+		t.Fatalf("expected retries to stop, but got %d dials", dialCount.Load())
+	}
+}
+
+func TestClient_OnConnect_MultipleHooks_FirstErrorWins(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	var hook1Called, hook2Called bool
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.OnConnect(func(peerID string) error {
+			hook1Called = true
+			return fmt.Errorf("hook1 rejects")
+		}),
+		client.OnConnect(func(peerID string) error {
+			hook2Called = true
+			return nil
+		}),
+	)
+	defer c.Close()
+
+	err := c.Connect("client-peer", wsURL(ts), authHeader("test-token"))
+	if err == nil {
+		t.Fatal("expected error from first hook")
+	}
+
+	if !hook1Called {
+		t.Fatal("first hook should have been called")
+	}
+	if hook2Called {
+		t.Fatal("second hook should NOT be called after first rejects")
+	}
+}

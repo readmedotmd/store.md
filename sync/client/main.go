@@ -56,6 +56,25 @@ type dialInfo struct {
 //
 // Protocol messages:
 //   - sync: carries a SyncPayload with items the peer hasn't seen
+//
+// # Hooks
+//
+// The client supports interceptor hooks that can observe, cancel, or modify
+// behavior at key lifecycle points. All hooks are registered via Option
+// functions at construction time.
+//
+//   - [OnConnect]: Called after a connection is established. Return an error
+//     to reject and close the connection immediately.
+//   - [OnDisconnect]: Called when a connection drops unexpectedly. Return
+//     false to suppress automatic reconnection for this disconnect.
+//   - [OnConnectError]: Called when a dial/reconnection attempt fails.
+//     Return false to stop retrying and give up on reconnection.
+//   - [WithHeaderProvider]: Called before every dial (including reconnects)
+//     to provide fresh HTTP headers (e.g. refreshed auth tokens).
+//
+// Multiple hooks of the same type are called in registration order. For
+// boolean hooks, any hook returning false will suppress the behavior (even
+// if other hooks return true). For error hooks, the first error short-circuits.
 type Client struct {
 	store  storesync.SyncStore
 	logger *slog.Logger

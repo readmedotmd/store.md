@@ -399,3 +399,154 @@ func TestOnSendError_Hook(t *testing.T) {
 	}
 	mu.Unlock()
 }
+
+func TestOnSendComplete_TransformsResponse(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	// Hook transforms the response.
+	a.OnSendComplete(func(env Envelope, response string) string {
+		return "transformed:" + response
+	})
+
+	ctx := context.Background()
+	resp, err := a.Send(ctx, "b", "ping", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp != "transformed:pong" {
+		t.Fatalf("expected transformed:pong, got %q", resp)
+	}
+}
+
+func TestOnSendComplete_ChainsMultipleHooks(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	// Two hooks chaining transformations.
+	a.OnSendComplete(func(env Envelope, response string) string {
+		return "[1:" + response + "]"
+	})
+	a.OnSendComplete(func(env Envelope, response string) string {
+		return "[2:" + response + "]"
+	})
+
+	ctx := context.Background()
+	resp, err := a.Send(ctx, "b", "ping", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second hook receives output of first.
+	if resp != "[2:[1:pong]]" {
+		t.Fatalf("expected chained transformation, got %q", resp)
+	}
+}
+
+func TestOnSendError_SuppressesError(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("fail", func(msg Envelope) (string, error) {
+		return "", fmt.Errorf("handler error")
+	})
+
+	// Hook suppresses the error by returning nil.
+	a.OnSendError(func(env Envelope, err error) error {
+		return nil
+	})
+
+	ctx := context.Background()
+	_, err := a.Send(ctx, "b", "fail", "data")
+	if err != nil {
+		t.Fatalf("expected error to be suppressed, got: %v", err)
+	}
+}
+
+func TestOnSendError_TransformsError(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("fail", func(msg Envelope) (string, error) {
+		return "", fmt.Errorf("original error")
+	})
+
+	// Hook transforms the error.
+	a.OnSendError(func(env Envelope, err error) error {
+		return fmt.Errorf("wrapped: %w", err)
+	})
+
+	ctx := context.Background()
+	_, err := a.Send(ctx, "b", "fail", "data")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "wrapped: original error" {
+		t.Fatalf("expected wrapped error, got %q", err.Error())
+	}
+}
+
+func TestOnSendComplete_Unsubscribe(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	unsub := a.OnSendComplete(func(env Envelope, response string) string {
+		return "modified"
+	})
+
+	ctx := context.Background()
+	resp1, _ := a.Send(ctx, "b", "ping", "1")
+	if resp1 != "modified" {
+		t.Fatalf("expected modified, got %q", resp1)
+	}
+
+	unsub()
+
+	resp2, _ := a.Send(ctx, "b", "ping", "2")
+	if resp2 != "pong" {
+		t.Fatalf("expected pong after unsubscribe, got %q", resp2)
+	}
+}
+
+func TestOnSendError_Unsubscribe(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("fail", func(msg Envelope) (string, error) {
+		return "", fmt.Errorf("handler error")
+	})
+
+	unsub := a.OnSendError(func(env Envelope, err error) error {
+		return nil // suppress
+	})
+
+	ctx := context.Background()
+	_, err1 := a.Send(ctx, "b", "fail", "1")
+	if err1 != nil {
+		t.Fatalf("expected suppressed error, got %v", err1)
+	}
+
+	unsub()
+
+	_, err2 := a.Send(ctx, "b", "fail", "2")
+	if err2 == nil {
+		t.Fatal("expected error after unsubscribe")
+	}
+}

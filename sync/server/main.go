@@ -33,6 +33,17 @@ type TokenInfo struct {
 // sync protocol handling to pluggable transports. By default, it uses
 // WebSocket. Call EnableHTTP to also accept HTTP POST requests, or use
 // AddTransport to register custom transports.
+//
+// # Hooks
+//
+// The server supports interceptor hooks for peer lifecycle events:
+//
+//   - [Server.OnPeerConnect]: Called after authentication succeeds. Return an
+//     error to reject the connection with 403 Forbidden — useful for custom
+//     authorization logic, IP filtering, or capacity management beyond the
+//     built-in per-peer/total limits.
+//   - [Server.OnPeerDisconnect]: Called after a transport connection ends.
+//     This is a notification-only hook (no return value).
 type Server struct {
 	store    storesync.SyncStore // single-store mode (nil when using resolver)
 	resolver StoreResolver       // multi-store mode (nil when using single store)

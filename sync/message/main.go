@@ -41,6 +41,24 @@ const (
 )
 
 // StoreMessage adds request/response messaging on top of a sync store.
+//
+// # Hooks
+//
+// StoreMessage supports interceptor hooks that can transform or suppress
+// Send results:
+//
+//   - [StoreMessage.OnSendComplete]: Called when Send receives a successful
+//     response. The hook returns a (possibly modified) response string that
+//     replaces what Send returns to the caller. Use for decryption, logging,
+//     or response post-processing.
+//   - [StoreMessage.OnSendError]: Called when Send fails. The hook returns a
+//     (possibly modified) error. Return nil to suppress the error entirely —
+//     Send will return ("", nil) instead of an error.
+//   - [StoreMessage.OnMessage]: Called when an incoming request arrives.
+//     This is a notification-only hook (no return value).
+//
+// Multiple hooks are called in registration order. Each hook receives the
+// output of the previous hook (chained transformation).
 type StoreMessage struct {
 	ss *core.StoreSync
 	id string

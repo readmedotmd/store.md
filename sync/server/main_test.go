@@ -910,3 +910,108 @@ func TestServer_OnPeerConnect_OnPeerDisconnect(t *testing.T) {
 		t.Fatalf("expected OnPeerDisconnect called once, got %d", atomic.LoadInt64(&disconnected))
 	}
 }
+
+func TestServer_OnPeerConnect_RejectsWithForbidden(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"test-token": "peer1"}
+
+	srv := New(ss, TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		return fmt.Errorf("peer %s is banned", peerID)
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// WebSocket connection should be rejected — the upgrade will fail
+	// because ServeHTTP returns 403 before reaching the WebSocket transport.
+	header := http.Header{}
+	header.Set("Authorization", "Bearer test-token")
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(ts), header)
+	if err == nil {
+		t.Fatal("expected dial to fail when OnPeerConnect rejects")
+	}
+	if resp != nil && resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_OnPeerConnect_RejectsHTTP(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"test-token": "peer1"}
+
+	srv := New(ss, TokenAuth(tokens))
+	srv.EnableHTTP()
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		return fmt.Errorf("not allowed")
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	msg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	resp := httpPost(t, ts.URL, "test-token", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_OnPeerConnect_AllowsWhenNoError(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"test-token": "peer1"}
+
+	var hookCalled bool
+	srv := New(ss, TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		hookCalled = true
+		return nil // allow
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	conn := dialWS(t, wsURL(ts), "test-token")
+	_ = conn
+
+	if !hookCalled {
+		t.Fatal("OnPeerConnect hook was not called")
+	}
+}
+
+func TestServer_OnPeerConnect_MultipleHooks_FirstErrorRejects(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"test-token": "peer1"}
+
+	var hook1Called, hook2Called bool
+	srv := New(ss, TokenAuth(tokens))
+	srv.EnableHTTP()
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		hook1Called = true
+		return fmt.Errorf("hook1 rejects")
+	})
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		hook2Called = true
+		return nil
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	msg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	resp := httpPost(t, ts.URL, "test-token", msg)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+	if !hook1Called {
+		t.Fatal("first hook should have been called")
+	}
+	if hook2Called {
+		t.Fatal("second hook should NOT be called after first rejects")
+	}
+}
