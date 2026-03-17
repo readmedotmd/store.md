@@ -1683,7 +1683,7 @@ func TestSyncOut_CursorSafety_MultiInstance(t *testing.T) {
 	queueID := QueueID(item1WT, item1.ID, item1.Key)
 	store.Set(ctx, QueueKey(queueID), item1.ID)
 	store.Set(ctx, ValueKey(item1.ID), string(encoded))
-	store.Set(ctx, ViewKey(item1.Key), item1.ID)
+	store.Set(ctx, ViewEntryKey(item1.Key, item1.Timestamp, item1.ID), item1.ID)
 
 	// Second SyncOut: must include item-1 because the cursor should NOT
 	// have advanced past its WT (which is in the future). If the cursor
@@ -2430,7 +2430,7 @@ func TestSetItem_ValueKeyFailure_RestoresViewKey(t *testing.T) {
 	// Re-enable writes to verify state.
 	store.failValueKeySet = false
 
-	// The original value should still be intact (ViewKey restored).
+	// The original value should still be intact (its view entry is untouched).
 	val, getErr := ss.Get(ctx, "restore-key")
 	if getErr != nil {
 		t.Fatalf("Get after failed overwrite: %v", getErr)
@@ -2458,7 +2458,7 @@ func TestSetItem_ValueKeyFailure_NewKey_CleansUp(t *testing.T) {
 	// Re-enable writes.
 	store.failValueKeySet = false
 
-	// The key should not exist (ViewKey was cleaned up).
+	// The key should not exist (view entry was cleaned up).
 	_, getErr := ss.Get(ctx, "new-fail-key")
 	if !errors.Is(getErr, storemd.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for cleaned-up key, got %v", getErr)

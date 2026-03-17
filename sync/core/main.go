@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	gosync "sync"
 	"sync/atomic"
 	"time"
@@ -157,6 +158,12 @@ func WithMaxClockSkew(d time.Duration) Option {
 // StoreSync wraps a key-value store with queue-based sync support.
 // It tracks writes in a time-ordered queue, supports per-peer sync cursors,
 // and resolves conflicts using last-writer-wins timestamps.
+//
+// View entries use a multi-version append-only scheme: each write creates a
+// unique view entry key (ViewEntryKey) with a timestamp+ID postfix. Reads
+// list all entries for a key and pick the timestamp winner. GC workers clean
+// up losing entries asynchronously. This avoids per-key locking and makes
+// concurrent writes to the same key safe without coordination.
 type StoreSync struct {
 	store        storemd.Store
 	timeOffset   int64 // nanoseconds
@@ -167,10 +174,10 @@ type StoreSync struct {
 	logger       *slog.Logger
 
 	// Hooks
-	syncOutFilters []SyncOutFilter
-	syncInFilters  []SyncInFilter
-	postSyncOuts   []PostSyncOut
-	preSetItems    []PreSetItem
+	syncOutFilters  []SyncOutFilter
+	syncInFilters   []SyncInFilter
+	postSyncOuts    []PostSyncOut
+	preSetItems     []PreSetItem
 	onSyncCompletes []OnSyncComplete
 
 	gcWorkers int // number of GC workers (default 4)
@@ -310,9 +317,44 @@ func (s *StoreSync) notifyListeners(item SyncStoreItem) {
 	}
 }
 
-// ViewKey returns the store key that maps a logical key to its current value ID.
+// viewPrefixBase is the common prefix for all view entry keys.
+const viewPrefixBase = "%sync%view%"
+
+// ViewEntryKey returns the store key for a multi-version view entry.
+// Format: %sync%view%{key}\x00{timestamp_padded}%{id}
+// The null byte separator ensures entries for the same key are adjacent
+// when sorted, and the zero-padded timestamp ensures they sort by time.
+func ViewEntryKey(key string, ts int64, id string) string {
+	return fmt.Sprintf("%s%s\x00%019d%%%s", viewPrefixBase, key, ts, id)
+}
+
+// ViewPrefix returns the store prefix for listing all view entries of a key.
+// All entries for a given key share this prefix.
+func ViewPrefix(key string) string {
+	return viewPrefixBase + key + "\x00"
+}
+
+// extractUserKey extracts the original user key from a view entry store key.
+func extractUserKey(viewEntryKey string) string {
+	rest := viewEntryKey[len(viewPrefixBase):]
+	if idx := strings.IndexByte(rest, 0); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
+}
+
+// LockKey returns the store key used for atomic SetIfNotExists claims.
+// This key is separate from view entries and provides database-level
+// atomicity for the "create if not exists" operation.
+func LockKey(key string) string {
+	return "%sync%lock%" + key
+}
+
+// ViewKey returns a legacy view key for direct store writes (e.g. in tests
+// or external tooling that writes directly to the raw store). Normal
+// read/write paths use ViewEntryKey and ViewPrefix instead.
 func ViewKey(key string) string {
-	return "%sync%view%" + key
+	return ViewEntryKey(key, 0, "")
 }
 
 // ValueKey returns the store key for a value entry, keyed by unique item ID.
@@ -358,14 +400,28 @@ func (s *StoreSync) Set(ctx context.Context, key, value string) error {
 // Returns true if the write succeeded (key was new), false if the key already existed.
 // Only records the write in the sync operation log if the key was actually created.
 //
-// Atomicity is delegated to the underlying store's SetIfNotExists on the view key,
-// so this is safe even when multiple StoreSync instances share the same database.
-//
-// Implementation note: value and queue entries are written speculatively before
-// the atomic view key claim. If the claim fails, these entries are cleaned up
-// immediately. In rare crash scenarios between the speculative write and cleanup,
-// orphaned entries will be removed by the GC workers.
+// Atomicity is delegated to the underlying store's SetIfNotExists on a
+// separate lock key, so this is safe even when multiple StoreSync instances
+// share the same database.
 func (s *StoreSync) SetIfNotExists(ctx context.Context, key, value string) (bool, error) {
+	// First check if the key already has view entries.
+	existing, err := s.getItem(ctx, key)
+	if err != nil && !errors.Is(err, storemd.ErrNotFound) {
+		return false, err
+	}
+	if existing != nil && !existing.Deleted {
+		return false, nil // key exists and is not deleted
+	}
+
+	// Key doesn't exist or is a tombstone. For tombstones, use SetItem.
+	if existing != nil && existing.Deleted {
+		if err := s.SetItem(ctx, "", key, value); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// Key doesn't exist. Use LockKey for atomic claim.
 	item := SyncStoreItem{
 		App:       "",
 		Key:       key,
@@ -374,6 +430,17 @@ func (s *StoreSync) SetIfNotExists(ctx context.Context, key, value string) (bool
 		ID:        uuid.New().String(),
 	}
 
+	// Atomic claim via lock key. The underlying store's SetIfNotExists
+	// provides database-level atomicity.
+	created, err := s.store.SetIfNotExists(ctx, LockKey(key), item.ID)
+	if err != nil {
+		return false, err
+	}
+	if !created {
+		return false, nil // another writer claimed it
+	}
+
+	// We won the claim. Write value, queue, and view entries.
 	writeTime := time.Now().UnixNano() + s.timeOffset
 	item.WriteTimestamp = writeTime
 
@@ -382,8 +449,9 @@ func (s *StoreSync) SetIfNotExists(ctx context.Context, key, value string) (bool
 		return false, err
 	}
 
-	// Write the value and queue entry first (these are keyed by unique ID, so no conflict).
 	queueID := QueueID(writeTime, item.ID, item.Key)
+	viewEntryKey := ViewEntryKey(item.Key, item.Timestamp, item.ID)
+
 	if err := s.store.Set(ctx, ValueKey(item.ID), string(encoded)); err != nil {
 		return false, err
 	}
@@ -391,44 +459,18 @@ func (s *StoreSync) SetIfNotExists(ctx context.Context, key, value string) (bool
 		s.store.Delete(ctx, ValueKey(item.ID))
 		return false, err
 	}
-
-	// Atomically claim the view key. The underlying store's SetIfNotExists
-	// provides database-level atomicity (e.g. SET NX, INSERT ON CONFLICT DO NOTHING,
-	// bbolt transaction), so this is safe across multiple processes.
-	created, err := s.store.SetIfNotExists(ctx, ViewKey(key), item.ID)
-	if err != nil {
+	if err := s.store.Set(ctx, viewEntryKey, item.ID); err != nil {
 		s.store.Delete(ctx, QueueKey(queueID))
 		s.store.Delete(ctx, ValueKey(item.ID))
 		return false, err
 	}
 
-	if !created {
-		// View key already existed — another writer claimed it. Check if it's
-		// a tombstone (deleted item); if so, we can't use SetIfNotExists to
-		// reclaim it, so fall back to SetItem which overwrites.
-		existing, getErr := s.getItem(ctx, key)
-		if getErr == nil && existing.Deleted {
-			s.store.Delete(ctx, QueueKey(queueID))
-			s.store.Delete(ctx, ValueKey(item.ID))
-			if err := s.SetItem(ctx, "", key, value); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-		// Key genuinely exists and is not deleted. Clean up our speculative writes.
-		s.store.Delete(ctx, QueueKey(queueID))
-		s.store.Delete(ctx, ValueKey(item.ID))
-		return false, nil
-	}
-
-	// Validate write time after performing writes — same check as setItem.
-	// If the write took so long that writeTime is now in the past, a SyncOut cursor
-	// may have already advanced past this entry, causing the item to be missed.
+	// Validate write time after performing writes (TOCTOU).
 	if time.Now().UnixNano() > writeTime {
-		// Roll back: remove all three keys so we don't leave partial state.
-		s.store.Delete(ctx, ViewKey(key))
+		s.store.Delete(ctx, viewEntryKey)
 		s.store.Delete(ctx, QueueKey(queueID))
 		s.store.Delete(ctx, ValueKey(item.ID))
+		s.store.Delete(ctx, LockKey(key))
 		return false, fmt.Errorf("write time is in the past")
 	}
 
@@ -464,33 +506,22 @@ func (s *StoreSync) Delete(ctx context.Context, key string) error {
 }
 
 // List implements storemd.Store. Lists keys through the sync view layer.
+// Groups multi-version view entries by key and picks the timestamp winner.
 func (s *StoreSync) List(ctx context.Context, args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	viewArgs := storemd.ListArgs{
-		Prefix: ViewKey(args.Prefix),
-		Limit:  args.Limit,
-	}
-	if args.StartAfter != "" {
-		viewArgs.StartAfter = ViewKey(args.StartAfter)
-	}
-
-	list, err := s.store.List(ctx, viewArgs)
+	items, err := s.resolveView(ctx, args.Prefix, args.StartAfter, args.Limit)
 	if err != nil {
 		return nil, err
 	}
 
-	result := make([]storemd.KeyValuePair, 0, len(list))
-	for _, kv := range list {
-		item, err := s.getValue(ctx, kv.Value)
-		if err != nil {
-			if errors.Is(err, storemd.ErrNotFound) {
-				continue
-			}
-			return nil, err
-		}
+	result := make([]storemd.KeyValuePair, 0, len(items))
+	for _, item := range items {
 		if item.Deleted {
 			continue
 		}
 		result = append(result, storemd.KeyValuePair{Key: item.Key, Value: item.Value})
+	}
+	if args.Limit > 0 && len(result) > args.Limit {
+		result = result[:args.Limit]
 	}
 	return result, nil
 }
@@ -508,13 +539,55 @@ func (s *StoreSync) GetItem(ctx context.Context, key string) (*SyncStoreItem, er
 	return item, nil
 }
 
-// getItem returns the raw SyncStoreItem including tombstones.
+// getItem lists all view entries for the key and returns the timestamp winner.
+// Returns tombstones (Deleted=true) so callers can distinguish "deleted" from
+// "never existed". Triggers async GC if multiple entries are found.
 func (s *StoreSync) getItem(ctx context.Context, key string) (*SyncStoreItem, error) {
-	valueID, err := s.store.Get(ctx, ViewKey(key))
+	entries, err := s.store.List(ctx, storemd.ListArgs{
+		Prefix: ViewPrefix(key),
+	})
 	if err != nil {
 		return nil, err
 	}
-	return s.getValue(ctx, valueID)
+	if len(entries) == 0 {
+		return nil, storemd.ErrNotFound
+	}
+
+	var winner *SyncStoreItem
+	hasLosers := false
+	for _, kv := range entries {
+		item, err := s.getValue(ctx, kv.Value)
+		if err != nil {
+			if errors.Is(err, storemd.ErrNotFound) {
+				hasLosers = true // orphaned view entry
+				continue
+			}
+			return nil, err
+		}
+		if winner == nil || item.Timestamp > winner.Timestamp ||
+			(item.Timestamp == winner.Timestamp && item.ID > winner.ID) {
+			if winner != nil {
+				hasLosers = true
+			}
+			winner = item
+		} else {
+			hasLosers = true
+		}
+	}
+
+	if winner == nil {
+		return nil, storemd.ErrNotFound
+	}
+
+	// If there are losers, trigger async GC to clean them up.
+	if hasLosers {
+		select {
+		case s.gcCh <- gcRequest{key: key, currentID: winner.ID}:
+		default:
+		}
+	}
+
+	return winner, nil
 }
 
 // getValue deserializes a SyncStoreItem from the store by its unique value ID.
@@ -530,37 +603,99 @@ func (s *StoreSync) getValue(ctx context.Context, id string) (*SyncStoreItem, er
 	return &item, nil
 }
 
-// ListItems returns SyncStoreItems matching the given prefix, pagination, and limit.
-func (s *StoreSync) ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
-	args := storemd.ListArgs{
-		Prefix: ViewKey(prefix),
-		Limit:  limit,
-	}
+// resolveView lists view entries matching the prefix, groups by user key,
+// picks the timestamp winner per group, and returns them in sorted order.
+func (s *StoreSync) resolveView(ctx context.Context, prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
+	viewPrefix := viewPrefixBase + prefix
+	var cursor string
 	if startAfter != "" {
-		args.StartAfter = ViewKey(startAfter)
+		// Skip past all view entries for the startAfter key.
+		// \x01 > \x00 so this sorts after all entries for startAfter
+		// but before entries for any key > startAfter.
+		cursor = viewPrefixBase + startAfter + "\x01"
 	}
 
-	list, err := s.store.List(ctx, args)
+	batchSize := 100
+	result := make([]SyncStoreItem, 0)
+	var currentKey string
+	var currentWinner *SyncStoreItem
+
+	flushGroup := func() {
+		if currentWinner != nil {
+			result = append(result, *currentWinner)
+		}
+		currentWinner = nil
+	}
+
+	for {
+		list, err := s.store.List(ctx, storemd.ListArgs{
+			Prefix:     viewPrefix,
+			StartAfter: cursor,
+			Limit:      batchSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(list) == 0 {
+			break
+		}
+
+		for _, kv := range list {
+			cursor = kv.Key
+			userKey := extractUserKey(kv.Key)
+
+			if userKey != currentKey && currentKey != "" {
+				flushGroup()
+				if limit > 0 && len(result) >= limit {
+					return result[:limit], nil
+				}
+			}
+			currentKey = userKey
+
+			item, err := s.getValue(ctx, kv.Value)
+			if err != nil {
+				if errors.Is(err, storemd.ErrNotFound) {
+					continue
+				}
+				return nil, err
+			}
+
+			if currentWinner == nil || item.Timestamp > currentWinner.Timestamp ||
+				(item.Timestamp == currentWinner.Timestamp && item.ID > currentWinner.ID) {
+				currentWinner = item
+			}
+		}
+
+		if len(list) < batchSize {
+			break
+		}
+	}
+
+	flushGroup()
+	if limit > 0 && len(result) > limit {
+		result = result[:limit]
+	}
+
+	return result, nil
+}
+
+// ListItems returns SyncStoreItems matching the given prefix, pagination, and limit.
+func (s *StoreSync) ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]SyncStoreItem, error) {
+	items, err := s.resolveView(ctx, prefix, startAfter, limit)
 	if err != nil {
 		return nil, err
 	}
 
-	items := make([]SyncStoreItem, 0, len(list))
-	for _, kv := range list {
-		item, err := s.getValue(ctx, kv.Value)
-		if err != nil {
-			if errors.Is(err, storemd.ErrNotFound) {
-				continue
-			}
-			return nil, err
-		}
+	// Filter out deleted items.
+	result := make([]SyncStoreItem, 0, len(items))
+	for _, item := range items {
 		if item.Deleted {
 			continue
 		}
-		items = append(items, *item)
+		result = append(result, item)
 	}
 
-	return items, nil
+	return result, nil
 }
 
 // SetItem writes a value through the sync layer with app, key, and value.
@@ -581,20 +716,21 @@ func (s *StoreSync) SetItem(ctx context.Context, app, key, value string) error {
 }
 
 // setItem is the core write path. It validates timestamps, applies PreSetItem
-// hooks, writes queue/view/value keys, validates write time (TOCTOU), and
-// notifies listeners. Returns ErrStaleWrite if the existing item is newer.
+// hooks, writes queue/view-entry/value keys, validates write time (TOCTOU),
+// and notifies listeners. Returns ErrStaleWrite if the existing item is newer.
+//
+// Each write creates a unique view entry key with a timestamp+ID postfix,
+// so concurrent writers never overwrite each other's view entries. The
+// timestamp winner is resolved at read time, and GC cleans up losers.
 func (s *StoreSync) setItem(ctx context.Context, item SyncStoreItem, notify func(SyncStoreItem)) error {
-	writeTime := time.Now().UnixNano() + s.timeOffset
-
-	// Reject items with timestamps too far in the future (clock skew protection).
-	// Account for timeOffset since peers using the same offset will generate
-	// timestamps relative to their own clock + offset.
 	maxTimestamp := time.Now().UnixNano() + s.timeOffset + int64(s.maxClockSkew)
 	if item.Timestamp > maxTimestamp {
 		return fmt.Errorf("item timestamp too far in the future (clock skew exceeds %v)", s.maxClockSkew)
 	}
 
-	// Check if existing item is newer (use getItem to see tombstones too)
+	writeTime := time.Now().UnixNano() + s.timeOffset
+
+	// Check if existing item is newer (use getItem to see tombstones too).
 	existing, err := s.getItem(ctx, item.Key)
 	if err != nil && !errors.Is(err, storemd.ErrNotFound) {
 		return err
@@ -606,7 +742,7 @@ func (s *StoreSync) setItem(ctx context.Context, item SyncStoreItem, notify func
 	item.WriteTimestamp = writeTime
 	queueID := QueueID(writeTime, item.ID, item.Key)
 
-	// Apply PreSetItem hooks - allow modification before storage
+	// Apply PreSetItem hooks — allow modification before storage.
 	for _, hook := range s.preSetItems {
 		hook(&item)
 	}
@@ -616,47 +752,36 @@ func (s *StoreSync) setItem(ctx context.Context, item SyncStoreItem, notify func
 		return err
 	}
 
+	// Write queue entry (unique ID, no conflict).
 	if err := s.store.Set(ctx, QueueKey(queueID), item.ID); err != nil {
 		return err
 	}
-	if err := s.store.Set(ctx, ViewKey(item.Key), item.ID); err != nil {
+
+	// Write view entry (unique key with timestamp+ID postfix, no conflict).
+	viewEntryKey := ViewEntryKey(item.Key, item.Timestamp, item.ID)
+	if err := s.store.Set(ctx, viewEntryKey, item.ID); err != nil {
 		s.store.Delete(ctx, QueueKey(queueID))
 		return err
 	}
+
+	// Write value entry.
 	if err := s.store.Set(ctx, ValueKey(item.ID), string(encoded)); err != nil {
 		s.store.Delete(ctx, QueueKey(queueID))
-		// Restore ViewKey to previous value instead of deleting it,
-		// otherwise an existing key would disappear on a failed write.
-		if existing != nil {
-			s.store.Set(ctx, ViewKey(item.Key), existing.ID)
-		} else {
-			s.store.Delete(ctx, ViewKey(item.Key))
-		}
+		s.store.Delete(ctx, viewEntryKey)
 		return err
 	}
 
 	// Validate write time after performing writes (we want TOCTOU, else we will miss sync items).
-	// This MUST happen before cleaning up the old value, because if validation
-	// fails we need to rollback the view key to the old value ID — which requires
-	// the old value entry to still exist.
 	if time.Now().UnixNano() > writeTime {
 		s.store.Delete(ctx, QueueKey(queueID))
+		s.store.Delete(ctx, viewEntryKey)
 		s.store.Delete(ctx, ValueKey(item.ID))
-		if existing != nil {
-			s.store.Set(ctx, ViewKey(item.Key), existing.ID)
-		} else {
-			s.store.Delete(ctx, ViewKey(item.Key))
-		}
 		return fmt.Errorf("write time is in the past")
 	}
 
-	// Clean up the old value inline if it's being replaced.
-	// Done after validation so rollback can restore the old value.
-	if existing != nil && existing.ID != item.ID {
-		s.store.Delete(ctx, ValueKey(existing.ID))
-	}
-
 	// Send GC request to bounded worker pool (non-blocking).
+	// The GC worker will find all view entries for this key,
+	// determine the winner, and clean up losers.
 	select {
 	case s.gcCh <- gcRequest{key: item.Key, currentID: item.ID}:
 	default:
@@ -669,16 +794,68 @@ func (s *StoreSync) setItem(ctx context.Context, item SyncStoreItem, notify func
 	return nil
 }
 
-// gcKey scans for all queue entries referencing the given key and removes
-// any that don't belong to the current value ID. This cleans up orphaned
-// values and queue entries that may have been missed by previous writes.
-func (s *StoreSync) gcKey(ctx context.Context, key, currentID string) {
-	// Scan all queue entries to find ones referencing this key.
-	// Queue keys are: %sync%queue%{writeTime}%{uuid}%{key}
+// gcKey scans view entries for the given key, determines the timestamp winner,
+// and removes losing view entries, their value entries, and orphaned queue
+// entries. This cleans up the multi-version view entries left by concurrent
+// or sequential writes to the same key.
+func (s *StoreSync) gcKey(ctx context.Context, key, _ string) {
+	// List all view entries for this key.
+	entries, err := s.store.List(ctx, storemd.ListArgs{
+		Prefix: ViewPrefix(key),
+	})
+	if err != nil || len(entries) <= 1 {
+		return // nothing to GC (0 or 1 entry)
+	}
+
+	// Load all candidates and find the winner.
+	type viewEntry struct {
+		storeKey string // view entry store key
+		itemID   string // value ID
+		item     *SyncStoreItem
+	}
+	var candidates []viewEntry
+	for _, kv := range entries {
+		item, err := s.getValue(ctx, kv.Value)
+		if err != nil {
+			if errors.Is(err, storemd.ErrNotFound) {
+				// Orphaned view entry — delete it.
+				s.store.Delete(ctx, kv.Key)
+				continue
+			}
+			return // store error, bail
+		}
+		candidates = append(candidates, viewEntry{storeKey: kv.Key, itemID: kv.Value, item: item})
+	}
+
+	if len(candidates) <= 1 {
+		return
+	}
+
+	// Find winner (highest timestamp, then highest ID as tiebreaker).
+	winnerIdx := 0
+	for i := 1; i < len(candidates); i++ {
+		w := candidates[winnerIdx].item
+		c := candidates[i].item
+		if c.Timestamp > w.Timestamp || (c.Timestamp == w.Timestamp && c.ID > w.ID) {
+			winnerIdx = i
+		}
+	}
+
+	// Collect loser IDs so we only delete values we know are losers.
+	loserIDs := make(map[string]struct{}, len(candidates)-1)
+	for i, c := range candidates {
+		if i == winnerIdx {
+			continue
+		}
+		loserIDs[c.itemID] = struct{}{}
+		s.store.Delete(ctx, c.storeKey)
+		s.store.Delete(ctx, ValueKey(c.itemID))
+	}
+
+	// Clean up queue entries that reference known losers.
 	suffix := "%" + key
 	var startAfter string
 	for {
-		// Check if we should stop.
 		select {
 		case <-s.done:
 			return
@@ -695,8 +872,6 @@ func (s *StoreSync) gcKey(ctx context.Context, key, currentID string) {
 		}
 		for _, kv := range list {
 			startAfter = kv.Key
-			// Check if this queue entry references our key.
-			// Strip the queue prefix to get the queue ID portion.
 			queueID := kv.Key[len(QueueKey("")):]
 			if len(queueID) < len(suffix) {
 				continue
@@ -704,10 +879,9 @@ func (s *StoreSync) gcKey(ctx context.Context, key, currentID string) {
 			if queueID[len(queueID)-len(suffix):] != suffix {
 				continue
 			}
-			// This queue entry is for our key. Remove it if it points to an old value.
-			if kv.Value != currentID {
+			// Only delete queue entries for known losers, not unknown new writes.
+			if _, isLoser := loserIDs[kv.Value]; isLoser {
 				s.store.Delete(ctx, kv.Key)
-				s.store.Delete(ctx, ValueKey(kv.Value))
 			}
 		}
 		if len(list) < 100 {
