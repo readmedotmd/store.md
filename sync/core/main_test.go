@@ -1774,3 +1774,57 @@ func TestSyncIn_AcceptsPastTimestamp(t *testing.T) {
 		t.Fatalf("expected value 'val', got %q", item.Value)
 	}
 }
+
+func TestOnSyncComplete_Hook(t *testing.T) {
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var calls []struct {
+		peer     string
+		in, out  int
+	}
+
+	ss := NewWithOptions(newMemStore(),
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithOnSyncComplete(func(peerID string, itemsIn, itemsOut int) {
+			mu.Lock()
+			calls = append(calls, struct {
+				peer     string
+				in, out  int
+			}{peerID, itemsIn, itemsOut})
+			mu.Unlock()
+		}),
+	)
+	defer ss.Close()
+
+	// Write some items.
+	if err := ss.SetItem(ctx, "app", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.SetItem(ctx, "app", "k2", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Sync with no incoming — should report items out.
+	_, err := ss.Sync(ctx, "peer1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 OnSyncComplete call, got %d", len(calls))
+	}
+	if calls[0].peer != "peer1" {
+		t.Fatalf("expected peer1, got %s", calls[0].peer)
+	}
+	if calls[0].in != 0 {
+		t.Fatalf("expected 0 items in, got %d", calls[0].in)
+	}
+	if calls[0].out != 2 {
+		t.Fatalf("expected 2 items out, got %d", calls[0].out)
+	}
+	mu.Unlock()
+}

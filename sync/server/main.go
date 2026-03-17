@@ -58,6 +58,10 @@ type Server struct {
 	adaptersMu gosync.Mutex
 	adapters   map[storesync.SyncStore]*client.Client
 
+	// Hooks
+	onPeerConnect    []func(peerID string, r *http.Request) error
+	onPeerDisconnect []func(peerID string)
+
 	httpServer *http.Server // set by ListenAndServe/ListenAndServeTLS
 }
 
@@ -148,6 +152,19 @@ func (s *Server) SetAllowedOrigins(origins []string) {
 		}
 		return false
 	}
+}
+
+// OnPeerConnect registers an interceptor invoked after a peer is authenticated.
+// Return a non-nil error to reject the connection — the server will respond
+// with 403 Forbidden.
+func (s *Server) OnPeerConnect(fn func(peerID string, r *http.Request) error) {
+	s.onPeerConnect = append(s.onPeerConnect, fn)
+}
+
+// OnPeerDisconnect registers a callback invoked after a peer's transport
+// connection ends (e.g. WebSocket closed, HTTP request completed).
+func (s *Server) OnPeerDisconnect(fn func(peerID string)) {
+	s.onPeerDisconnect = append(s.onPeerDisconnect, fn)
 }
 
 // AddTransport registers a transport with the server. Transports are tried
@@ -395,11 +412,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	for _, fn := range s.onPeerConnect {
+		if err := fn(peerID, r); err != nil {
+			s.releaseConn(peerID)
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+	}
+
 	adapter := s.getAdapter(store)
 	if err := transport.Serve(w, r, peerID, store, adapter, s.logger); err != nil {
 		s.logger.Error("transport error", "err", err)
 	}
 	s.releaseConn(peerID)
+
+	for _, fn := range s.onPeerDisconnect {
+		fn(peerID)
+	}
 }
 
 // ListenAndServe starts an HTTP server on the given address. It blocks until

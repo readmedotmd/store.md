@@ -65,6 +65,11 @@ type PostSyncOut func(ctx context.Context, items []SyncStoreItem, peerID string)
 // item from the previous hook.
 type PreSetItem func(item *SyncStoreItem)
 
+// OnSyncComplete is called after a Sync exchange finishes. It receives the
+// peer ID, the number of items received (in), and the number of items sent (out).
+// Multiple callbacks are invoked in registration order.
+type OnSyncComplete func(peerID string, itemsIn, itemsOut int)
+
 type SyncStoreItem struct {
 	App            string `json:"app"`
 	Key            string `json:"key"`
@@ -122,6 +127,12 @@ func WithPreSetItem(fn PreSetItem) Option {
 	return func(s *StoreSync) { s.preSetItems = append(s.preSetItems, fn) }
 }
 
+// WithOnSyncComplete adds a callback invoked after each Sync exchange with
+// the number of items received and sent. Use for observability or metrics.
+func WithOnSyncComplete(fn OnSyncComplete) Option {
+	return func(s *StoreSync) { s.onSyncCompletes = append(s.onSyncCompletes, fn) }
+}
+
 type StoreSync struct {
 	store        storemd.Store
 	timeOffset   int64 // nanoseconds
@@ -136,6 +147,7 @@ type StoreSync struct {
 	syncInFilters  []SyncInFilter
 	postSyncOuts   []PostSyncOut
 	preSetItems    []PreSetItem
+	onSyncCompletes []OnSyncComplete
 
 	// Bounded GC worker pool
 	gcCh chan gcRequest
@@ -802,6 +814,15 @@ func (s *StoreSync) Sync(ctx context.Context, peerID string, incoming *SyncPaylo
 			}
 		}
 		payload.Items = filtered
+	}
+
+	itemsIn := 0
+	if incoming != nil {
+		itemsIn = len(incoming.Items)
+	}
+	itemsOut := len(payload.Items)
+	for _, fn := range s.onSyncCompletes {
+		fn(peerID, itemsIn, itemsOut)
 	}
 
 	if len(payload.Items) == 0 {

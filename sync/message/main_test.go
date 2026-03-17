@@ -132,7 +132,7 @@ func TestOnMessage_DoesNotFireForRegularData(t *testing.T) {
 		count++
 	})
 
-	m.Set("normalkey", "value")
+	m.Set(context.Background(), "normalkey", "value")
 
 	if count != 0 {
 		t.Fatalf("expected 0 message listener calls for regular data, got %d", count)
@@ -276,7 +276,8 @@ func TestSyncRoundTrip_CrossStore(t *testing.T) {
 		Data:      "hello",
 	}
 	encoded, _ := json.Marshal(env)
-	ss1.SetItem("msg", reqKey("b", "cross-1"), string(encoded))
+	ctx := context.Background()
+	ss1.SetItem(ctx, "msg", reqKey("b", "cross-1"), string(encoded))
 
 	// Register pending channel on A
 	ch := make(chan Envelope, 1)
@@ -285,22 +286,22 @@ func TestSyncRoundTrip_CrossStore(t *testing.T) {
 	a.pendingMu.Unlock()
 
 	// Sync ss1 -> ss2 (delivers the request to B)
-	payload, err := ss1.SyncOut("ss2", 0)
+	payload, err := ss1.SyncOut(ctx, "ss2", 0)
 	if err != nil {
 		t.Fatalf("SyncOut failed: %v", err)
 	}
-	if err := ss2.SyncIn("ss1", *payload); err != nil {
+	if err := ss2.SyncIn(ctx, "ss1", *payload); err != nil {
 		t.Fatalf("SyncIn failed: %v", err)
 	}
 
 	// B should have handled and written a response to ss2
 	// Sync ss2 -> ss1 (delivers the response back to A)
 	time.Sleep(150 * time.Millisecond) // wait for writeTimestamp to pass
-	payload2, err := ss2.SyncOut("ss1", 0)
+	payload2, err := ss2.SyncOut(ctx, "ss1", 0)
 	if err != nil {
 		t.Fatalf("SyncOut 2 failed: %v", err)
 	}
-	if err := ss1.SyncIn("ss2", *payload2); err != nil {
+	if err := ss1.SyncIn(ctx, "ss2", *payload2); err != nil {
 		t.Fatalf("SyncIn 2 failed: %v", err)
 	}
 
@@ -322,4 +323,79 @@ func TestID(t *testing.T) {
 	if m.ID() != "my-store-id" {
 		t.Fatalf("expected %q, got %q", "my-store-id", m.ID())
 	}
+}
+
+func TestOnSendComplete_Hook(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	var mu gosync.Mutex
+	var completedEnv Envelope
+	var completedResponse string
+	a.OnSendComplete(func(env Envelope, response string) string {
+		mu.Lock()
+		completedEnv = env
+		completedResponse = response
+		mu.Unlock()
+		return response
+	})
+
+	ctx := context.Background()
+	resp, err := a.Send(ctx, "b", "ping", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp != "pong" {
+		t.Fatalf("expected pong, got %q", resp)
+	}
+
+	mu.Lock()
+	if completedEnv.Type != "ping" {
+		t.Fatalf("expected type ping, got %q", completedEnv.Type)
+	}
+	if completedResponse != "pong" {
+		t.Fatalf("expected response pong, got %q", completedResponse)
+	}
+	mu.Unlock()
+}
+
+func TestOnSendError_Hook(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a")
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("fail", func(msg Envelope) (string, error) {
+		return "", fmt.Errorf("handler error")
+	})
+
+	var mu gosync.Mutex
+	var errorEnv Envelope
+	var sendErr error
+	a.OnSendError(func(env Envelope, err error) error {
+		mu.Lock()
+		errorEnv = env
+		sendErr = err
+		mu.Unlock()
+		return err
+	})
+
+	ctx := context.Background()
+	_, err := a.Send(ctx, "b", "fail", "data")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	mu.Lock()
+	if errorEnv.Type != "fail" {
+		t.Fatalf("expected type fail, got %q", errorEnv.Type)
+	}
+	if sendErr == nil {
+		t.Fatal("expected error in OnSendError")
+	}
+	mu.Unlock()
 }

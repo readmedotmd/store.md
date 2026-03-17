@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -871,5 +872,41 @@ func TestServer_UntrustedProxy_IgnoresXFF(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after rate limit, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_OnPeerConnect_OnPeerDisconnect(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"test-token": "peer1"}
+
+	var connected, disconnected int64
+	srv := New(ss, TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	srv.OnPeerConnect(func(peerID string, r *http.Request) error {
+		if peerID != "peer1" {
+			t.Errorf("expected peer1, got %s", peerID)
+		}
+		atomic.AddInt64(&connected, 1)
+		return nil
+	})
+	srv.OnPeerDisconnect(func(peerID string) {
+		atomic.AddInt64(&disconnected, 1)
+	})
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	ws := dialWS(t, wsURL(ts), "test-token")
+	time.Sleep(200 * time.Millisecond)
+
+	if atomic.LoadInt64(&connected) != 1 {
+		t.Fatalf("expected OnPeerConnect called once, got %d", atomic.LoadInt64(&connected))
+	}
+
+	ws.Close()
+	time.Sleep(500 * time.Millisecond)
+
+	if atomic.LoadInt64(&disconnected) != 1 {
+		t.Fatalf("expected OnPeerDisconnect called once, got %d", atomic.LoadInt64(&disconnected))
 	}
 }

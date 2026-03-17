@@ -55,17 +55,25 @@ type StoreMessage struct {
 	listeners      map[uint64]MessageListener
 	nextListenerID atomic.Uint64
 
+	sendCompleteMu   gosync.RWMutex
+	sendCompleteList  map[uint64]func(env Envelope, response string) string
+	sendErrorMu      gosync.RWMutex
+	sendErrorList     map[uint64]func(env Envelope, err error) error
+	nextHookID       atomic.Uint64
+
 	unsub func()
 }
 
 // New creates a StoreMessage with the given unique ID.
 func New(syncStore *core.StoreSync, id string) *StoreMessage {
 	m := &StoreMessage{
-		ss:        syncStore,
-		id:        id,
-		handlers:  make(map[string]Handler),
-		pending:   make(map[string]chan Envelope),
-		listeners: make(map[uint64]MessageListener),
+		ss:               syncStore,
+		id:               id,
+		handlers:         make(map[string]Handler),
+		pending:          make(map[string]chan Envelope),
+		listeners:        make(map[uint64]MessageListener),
+		sendCompleteList: make(map[uint64]func(env Envelope, response string) string),
+		sendErrorList:    make(map[uint64]func(env Envelope, err error) error),
 	}
 	m.unsub = syncStore.OnUpdate(m.onSyncUpdate)
 	return m
@@ -135,6 +143,38 @@ func (m *StoreMessage) OnMessage(fn MessageListener) func() {
 	}
 }
 
+// OnSendComplete registers an interceptor invoked when Send receives a
+// successful response. The interceptor receives the original envelope and
+// response data, and returns a (possibly modified) response string that
+// will be returned to the caller of Send. Returns an unsubscribe function.
+func (m *StoreMessage) OnSendComplete(fn func(env Envelope, response string) string) func() {
+	id := m.nextHookID.Add(1)
+	m.sendCompleteMu.Lock()
+	m.sendCompleteList[id] = fn
+	m.sendCompleteMu.Unlock()
+	return func() {
+		m.sendCompleteMu.Lock()
+		delete(m.sendCompleteList, id)
+		m.sendCompleteMu.Unlock()
+	}
+}
+
+// OnSendError registers an interceptor invoked when Send fails (context
+// cancelled, remote error, or store closed). The interceptor receives the
+// original envelope and error, and returns a (possibly modified) error.
+// Return nil to suppress the error entirely. Returns an unsubscribe function.
+func (m *StoreMessage) OnSendError(fn func(env Envelope, err error) error) func() {
+	id := m.nextHookID.Add(1)
+	m.sendErrorMu.Lock()
+	m.sendErrorList[id] = fn
+	m.sendErrorMu.Unlock()
+	return func() {
+		m.sendErrorMu.Lock()
+		delete(m.sendErrorList, id)
+		m.sendErrorMu.Unlock()
+	}
+}
+
 // Send sends a message to targetID and blocks until a response arrives or ctx is cancelled.
 func (m *StoreMessage) Send(ctx context.Context, targetID, msgType, data string) (string, error) {
 	messageID := uuid.New().String()
@@ -164,15 +204,28 @@ func (m *StoreMessage) Send(ctx context.Context, targetID, msgType, data string)
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			return "", errors.New("store closed")
+			err := m.notifySendError(env, errors.New("store closed"))
+			if err == nil {
+				return "", nil
+			}
+			return "", err
 		}
 		if resp.Error != "" {
-			return "", errors.New(resp.Error)
+			err := m.notifySendError(env, errors.New(resp.Error))
+			if err == nil {
+				return "", nil
+			}
+			return "", err
 		}
-		return resp.Data, nil
+		data := m.notifySendComplete(env, resp.Data)
+		return data, nil
 	case <-ctx.Done():
 		m.removePending(messageID)
-		return "", ctx.Err()
+		err := m.notifySendError(env, ctx.Err())
+		if err == nil {
+			return "", nil
+		}
+		return "", err
 	}
 }
 
@@ -245,6 +298,32 @@ func (m *StoreMessage) onSyncUpdate(item core.SyncStoreItem) {
 			ch <- env
 		}
 	}
+}
+
+func (m *StoreMessage) notifySendComplete(env Envelope, response string) string {
+	m.sendCompleteMu.RLock()
+	fns := make([]func(Envelope, string) string, 0, len(m.sendCompleteList))
+	for _, fn := range m.sendCompleteList {
+		fns = append(fns, fn)
+	}
+	m.sendCompleteMu.RUnlock()
+	for _, fn := range fns {
+		response = fn(env, response)
+	}
+	return response
+}
+
+func (m *StoreMessage) notifySendError(env Envelope, err error) error {
+	m.sendErrorMu.RLock()
+	fns := make([]func(Envelope, error) error, 0, len(m.sendErrorList))
+	for _, fn := range m.sendErrorList {
+		fns = append(fns, fn)
+	}
+	m.sendErrorMu.RUnlock()
+	for _, fn := range fns {
+		err = fn(env, err)
+	}
+	return err
 }
 
 func (m *StoreMessage) notifyMessageListeners(env Envelope) {

@@ -671,3 +671,180 @@ func TestClient_Reconnect_ServerSideConnNoReconnect(t *testing.T) {
 		}
 	}
 }
+
+func TestClient_OnConnect_Hook(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	var connected atomic.Int64
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore, client.OnConnect(func(peerID string) error {
+		connected.Add(1)
+		return nil
+	}))
+	defer c.Close()
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	if connected.Load() != 1 {
+		t.Fatalf("expected OnConnect called once, got %d", connected.Load())
+	}
+}
+
+func TestClient_OnDisconnect_Hook(t *testing.T) {
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	var disconnected atomic.Int64
+	var activeConn atomic.Pointer[breakableConn]
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.OnDisconnect(func(peerID string, err error) bool {
+			disconnected.Add(1)
+			return true
+		}),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			conn, err := client.Dial(peerID, url, header)
+			if err != nil {
+				return nil, err
+			}
+			bc := newBreakableConn(conn)
+			activeConn.Store(bc)
+			return bc, nil
+		}),
+	)
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	activeConn.Load().Break()
+
+	deadline := time.After(3 * time.Second)
+	for disconnected.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("OnDisconnect was never called")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func TestClient_OnConnectError_Hook(t *testing.T) {
+	var connectErrors atomic.Int64
+	var dialCount atomic.Int64
+
+	serverStore := newSyncStore(t)
+	ts := startServer(t, serverStore)
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.OnConnectError(func(peerID string, err error) bool {
+			connectErrors.Add(1)
+			return true
+		}),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			n := dialCount.Add(1)
+			if n == 1 {
+				conn, err := client.Dial(peerID, url, header)
+				if err != nil {
+					return nil, err
+				}
+				bc := newBreakableConn(conn)
+				go func() {
+					time.Sleep(50 * time.Millisecond)
+					bc.Break()
+				}()
+				return bc, nil
+			}
+			return nil, fmt.Errorf("simulated dial failure")
+		}),
+	)
+	defer c.Close()
+
+	if err := c.Connect("client-peer", wsURL(ts), authHeader("test-token")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for connectErrors.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("OnConnectError was never called")
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func TestClient_HeaderProvider(t *testing.T) {
+	var headerCalls atomic.Int64
+	var activeConn atomic.Pointer[breakableConn]
+	var dialCount atomic.Int64
+
+	serverStore := newSyncStore(t)
+	tokens := map[string]string{"token-v1": "test-peer", "token-v2": "test-peer"}
+	srv := server.New(serverStore, server.TokenAuth(tokens))
+	srv.SetAllowedOrigins([]string{"*"})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	clientStore := newSyncStore(t)
+	c := client.New(clientStore,
+		client.WithReconnect(50*time.Millisecond, 200*time.Millisecond),
+		client.WithHeaderProvider(func(peerID, url string) (http.Header, error) {
+			n := headerCalls.Add(1)
+			h := http.Header{}
+			if n == 1 {
+				h.Set("Authorization", "Bearer token-v1")
+			} else {
+				h.Set("Authorization", "Bearer token-v2")
+			}
+			return h, nil
+		}),
+		client.WithDialer(func(peerID, url string, header http.Header) (client.Connection, error) {
+			n := dialCount.Add(1)
+			conn, err := client.Dial(peerID, url, header)
+			if err != nil {
+				return nil, err
+			}
+			bc := newBreakableConn(conn)
+			if n == 1 {
+				activeConn.Store(bc)
+			}
+			return bc, nil
+		}),
+	)
+	defer c.Close()
+
+	// Connect — headerProvider should be called for initial connect.
+	if err := c.Connect("client-peer", wsURL(ts), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if headerCalls.Load() < 1 {
+		t.Fatal("HeaderProvider was not called on initial connect")
+	}
+
+	// Break connection to trigger reconnect — headerProvider called again.
+	activeConn.Load().Break()
+
+	deadline := time.After(3 * time.Second)
+	for headerCalls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("HeaderProvider not called on reconnect, calls=%d", headerCalls.Load())
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}

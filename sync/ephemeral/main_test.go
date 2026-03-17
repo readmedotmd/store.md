@@ -927,3 +927,56 @@ func TestHandlerReplacement(t *testing.T) {
 		t.Fatalf("expected second handler to run, got %q", which)
 	}
 }
+
+func TestOnDelivered_Hook(t *testing.T) {
+	var mu sync.Mutex
+	var deliveredEnvs []Envelope
+	var deliveredPeers []string
+
+	ephA := New("nodeA", WithOnDelivered(func(env Envelope, peerID string) {
+		mu.Lock()
+		deliveredEnvs = append(deliveredEnvs, env)
+		deliveredPeers = append(deliveredPeers, peerID)
+		mu.Unlock()
+	}))
+	ssA, _ := newTestStoreSync("nodeA", ephA)
+	defer ssA.Close()
+
+	ephB := New("nodeB")
+	ssB, _ := newTestStoreSync("nodeB", ephB)
+	defer ssB.Close()
+
+	var received []Envelope
+	ephB.Handle("chat", func(msg Envelope) {
+		received = append(received, msg)
+	})
+
+	ctx := context.Background()
+
+	if err := ephA.Send(ctx, "nodeB", "chat", "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// SyncOut from A to B — should trigger OnDelivered.
+	out, err := ssA.Sync(ctx, "nodeB", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == nil {
+		t.Fatal("expected sync payload")
+	}
+
+	mu.Lock()
+	if len(deliveredEnvs) != 1 {
+		t.Fatalf("expected 1 delivery, got %d", len(deliveredEnvs))
+	}
+	if deliveredEnvs[0].Data != "hello" {
+		t.Fatalf("expected hello, got %q", deliveredEnvs[0].Data)
+	}
+	if deliveredPeers[0] != "nodeB" {
+		t.Fatalf("expected nodeB, got %q", deliveredPeers[0])
+	}
+	mu.Unlock()
+}

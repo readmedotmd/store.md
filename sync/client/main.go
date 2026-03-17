@@ -82,6 +82,12 @@ type Client struct {
 	pendingReconnMu  gosync.Mutex
 	pendingReconn    int
 
+	// Hooks
+	headerProvider func(peerID, url string) (http.Header, error)
+	onConnect      []func(peerID string) error
+	onDisconnect   []func(peerID string, err error) bool
+	onConnectError []func(peerID string, err error) bool
+
 	wg     gosync.WaitGroup // tracks all background goroutines
 	done   chan struct{}
 	unsub  func()
@@ -117,6 +123,36 @@ func WithReconnect(initialBackoff, maxBackoff time.Duration) Option {
 			c.reconnectMax = maxBackoff
 		}
 	}
+}
+
+// WithHeaderProvider sets a function that returns HTTP headers for each dial
+// attempt, including reconnections. This enables token refresh — the provider
+// is called before every dial so it can return fresh credentials. When set,
+// the header parameter passed to Connect is ignored.
+func WithHeaderProvider(fn func(peerID, url string) (http.Header, error)) Option {
+	return func(c *Client) { c.headerProvider = fn }
+}
+
+// OnConnect registers an interceptor invoked after a connection is established,
+// including after successful reconnection. Return a non-nil error to reject
+// the connection — it will be closed immediately.
+func OnConnect(fn func(peerID string) error) Option {
+	return func(c *Client) { c.onConnect = append(c.onConnect, fn) }
+}
+
+// OnDisconnect registers an interceptor invoked when a connection drops
+// unexpectedly (not via explicit Close). The error is the read error that
+// caused the disconnect. Return false to suppress automatic reconnection
+// for this disconnect event.
+func OnDisconnect(fn func(peerID string, err error) bool) Option {
+	return func(c *Client) { c.onDisconnect = append(c.onDisconnect, fn) }
+}
+
+// OnConnectError registers an interceptor invoked when a dial attempt fails,
+// including reconnection attempts. Return false to stop retrying and give up
+// on reconnection.
+func OnConnectError(fn func(peerID string, err error) bool) Option {
+	return func(c *Client) { c.onConnectError = append(c.onConnectError, fn) }
 }
 
 // New creates a Client that syncs the given store over connections.
@@ -185,6 +221,13 @@ func (c *Client) notifyLoop() {
 // switch to HTTP or a custom transport. Can be called multiple times to
 // connect to multiple servers.
 func (c *Client) Connect(peerID, url string, header http.Header) error {
+	if c.headerProvider != nil {
+		h, err := c.headerProvider(peerID, url)
+		if err != nil {
+			return fmt.Errorf("header provider: %w", err)
+		}
+		header = h
+	}
 	conn, err := c.dialer(peerID, url, header)
 	if err != nil {
 		return err
@@ -232,6 +275,15 @@ func (c *Client) addConn(conn Connection, active bool, di *dialInfo) error {
 	c.connsMu.Lock()
 	c.conns = append(c.conns, mc)
 	c.connsMu.Unlock()
+
+	for _, fn := range c.onConnect {
+		if err := fn(conn.PeerID()); err != nil {
+			// Hook rejected the connection — remove and close it.
+			c.removeConn(mc)
+			conn.Close()
+			return fmt.Errorf("onConnect rejected: %w", err)
+		}
+	}
 
 	c.wg.Add(1)
 	go func() { defer c.wg.Done(); c.readLoop(mc) }()
@@ -299,9 +351,37 @@ func (c *Client) reconnectLoop(di *dialInfo) {
 
 		c.logger.Info("reconnecting", "peer", di.peerID, "attempt", attempt+1, "backoff", backoff)
 
-		conn, err := c.dialer(di.peerID, di.url, di.header)
+		header := di.header
+		if c.headerProvider != nil {
+			h, err := c.headerProvider(di.peerID, di.url)
+			if err != nil {
+				c.logger.Error("header provider failed during reconnect", "peer", di.peerID, "err", err)
+				keepRetrying := true
+				for _, fn := range c.onConnectError {
+					if !fn(di.peerID, err) {
+						keepRetrying = false
+					}
+				}
+				if !keepRetrying {
+					return
+				}
+			} else {
+				header = h
+			}
+		}
+
+		conn, err := c.dialer(di.peerID, di.url, header)
 		if err != nil {
 			c.logger.Error("reconnect dial failed", "peer", di.peerID, "err", err)
+			keepRetrying := true
+			for _, fn := range c.onConnectError {
+				if !fn(di.peerID, err) {
+					keepRetrying = false
+				}
+			}
+			if !keepRetrying {
+				return
+			}
 			attempt++
 
 			select {
@@ -411,17 +491,26 @@ func (c *Client) pushToAll(sender *managedConn) {
 
 // readLoop reads messages from a connection and handles them.
 func (c *Client) readLoop(mc *managedConn) {
+	var readErr error
 	defer func() {
-		shouldReconnect := false
-		if mc.dialInfo != nil {
-			// Only reconnect if the drop was unexpected (not explicit close).
-			select {
-			case <-c.done:
-			case <-mc.done:
-			default:
-				shouldReconnect = true
+		unexpectedDrop := false
+		select {
+		case <-c.done:
+		case <-mc.done:
+		default:
+			unexpectedDrop = true
+		}
+
+		allowReconnect := true
+		if unexpectedDrop {
+			for _, fn := range c.onDisconnect {
+				if !fn(mc.PeerID(), readErr) {
+					allowReconnect = false
+				}
 			}
 		}
+
+		shouldReconnect := unexpectedDrop && mc.dialInfo != nil && allowReconnect
 		if shouldReconnect {
 			// Increment before removeConn so auto-close doesn't fire.
 			c.pendingReconnMu.Lock()
@@ -441,6 +530,7 @@ func (c *Client) readLoop(mc *managedConn) {
 	for {
 		msg, err := mc.ReadMessage()
 		if err != nil {
+			readErr = err
 			select {
 			case <-mc.done:
 			case <-c.done:

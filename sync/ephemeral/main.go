@@ -100,6 +100,13 @@ func WithSeenCapacity(n int) Option {
 	return func(l *Layer) { l.seenCap = n }
 }
 
+// WithOnDelivered registers a callback invoked after an ephemeral message has
+// been included in a SyncOut payload to a peer. The envelope is the delivered
+// message and peerID is the receiving peer.
+func WithOnDelivered(fn func(env Envelope, peerID string)) Option {
+	return func(l *Layer) { l.onDelivered = append(l.onDelivered, fn) }
+}
+
 // Layer provides ephemeral (non-persisted) targeted message passing on top
 // of StoreSync. Install its hooks via Options() when constructing the StoreSync,
 // then call Bind() to complete setup.
@@ -114,6 +121,8 @@ type Layer struct {
 	seen      map[string]struct{}
 	seenOrder []string
 	seenCap   int
+
+	onDelivered []func(env Envelope, peerID string)
 }
 
 // New creates an ephemeral Layer for the given node ID.
@@ -243,6 +252,16 @@ func (l *Layer) postSyncOut(ctx context.Context, items []core.SyncStoreItem, pee
 		if _, _, ok := parseEphKey(item.Key); !ok {
 			continue
 		}
+
+		if len(l.onDelivered) > 0 {
+			var env Envelope
+			if err := json.Unmarshal([]byte(item.Value), &env); err == nil {
+				for _, fn := range l.onDelivered {
+					fn(env, peerID)
+				}
+			}
+		}
+
 		// Delete directly from underlying store — no tombstone, no sync queue entry.
 		raw.Delete(ctx, core.ViewKey(item.Key))
 		raw.Delete(ctx, core.ValueKey(item.ID))
