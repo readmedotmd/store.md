@@ -137,6 +137,7 @@ func (m *StoreMessage) SetItem(ctx context.Context, app, key, value string) erro
 func (m *StoreMessage) ListItems(ctx context.Context, prefix, startAfter string, limit int) ([]core.SyncStoreItem, error) { return m.ss.ListItems(ctx, prefix, startAfter, limit) }
 func (m *StoreMessage) OnUpdate(fn core.UpdateListener) func()                        { return m.ss.OnUpdate(fn) }
 func (m *StoreMessage) Sync(ctx context.Context, peerID string, incoming *core.SyncPayload) (*core.SyncPayload, error) { return m.ss.Sync(ctx, peerID, incoming) }
+func (m *StoreMessage) AckSyncOut(ctx context.Context, peerID string, payload *core.SyncPayload) error { return m.ss.AckSyncOut(ctx, peerID, payload) }
 
 // --- Messaging API ---
 

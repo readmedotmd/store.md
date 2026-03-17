@@ -494,6 +494,12 @@ func (c *Client) initiateSync(mc *managedConn) {
 	mc.mu.Unlock()
 	if err != nil {
 		c.logger.Error("send error during initiate sync", "err", err)
+		return
+	}
+
+	// Advance cursor only after successful write to peer.
+	if err := c.store.AckSyncOut(ctx, mc.PeerID(), payload); err != nil {
+		c.logger.Error("ack sync out error", "err", err)
 	}
 }
 
@@ -611,6 +617,11 @@ func (c *Client) readLoop(mc *managedConn) {
 				mc.mu.Unlock()
 				if err != nil {
 					c.logger.Error("send error", "err", err)
+				} else {
+					// Advance cursor only after successful write to peer.
+					if ackErr := c.store.AckSyncOut(ctx, mc.PeerID(), response); ackErr != nil {
+						c.logger.Error("ack sync out error", "err", ackErr)
+					}
 				}
 			}
 

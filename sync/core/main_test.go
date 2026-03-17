@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -37,8 +38,8 @@ func (s *memStore) Get(_ context.Context, key string) (string, error) {
 
 func (s *memStore) Set(_ context.Context, key, value string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.data[key] = value
-	s.mu.Unlock()
 	return nil
 }
 
@@ -175,7 +176,7 @@ func TestSet_OlderTimestampIgnored(t *testing.T) {
 		Timestamp: time.Now().UnixNano() + int64(2*time.Minute),
 		ID:        "future-id",
 	}
-	if err := s.setItem(futureItem); err != nil {
+	if err := s.setItem(ctx, futureItem, s.notifyListeners); err != nil {
 		t.Fatalf("set future item failed: %v", err)
 	}
 
@@ -312,6 +313,9 @@ func TestSyncOut_Incremental(t *testing.T) {
 	if len(payload1.Items) != 1 {
 		t.Fatalf("expected 1 item in first sync, got %d", len(payload1.Items))
 	}
+	if err := s.AckSyncOut(ctx, "peer1", payload1); err != nil {
+		t.Fatalf("AckSyncOut failed: %v", err)
+	}
 
 	// Add another item
 	time.Sleep(time.Millisecond)
@@ -374,6 +378,9 @@ func TestSyncOut_SeparatePerPeer(t *testing.T) {
 	}
 	if len(p1.Items) != 1 {
 		t.Fatalf("expected 1 item for peer1, got %d", len(p1.Items))
+	}
+	if err := s.AckSyncOut(ctx, "peer1", p1); err != nil {
+		t.Fatalf("AckSyncOut peer1 failed: %v", err)
 	}
 
 	// Sync out to peer2 should also get key1 (independent cursor)
@@ -744,6 +751,7 @@ func TestTimestampBoundsCheck(t *testing.T) {
 	store := newMemStore()
 	ss := New(store, 10_000_000_000)
 	defer ss.Close()
+	ctx := context.Background()
 
 	// Create an item with a timestamp far in the future.
 	futureItem := SyncStoreItem{
@@ -753,7 +761,7 @@ func TestTimestampBoundsCheck(t *testing.T) {
 		ID:        "future-id",
 	}
 
-	err := ss.setItem(futureItem)
+	err := ss.setItem(ctx, futureItem, ss.notifyListeners)
 	if err == nil {
 		t.Fatal("expected error for future timestamp, got nil")
 	}
@@ -768,8 +776,37 @@ func TestTimestampBoundsCheck(t *testing.T) {
 		Timestamp: time.Now().UnixNano() + int64(1*time.Minute), // 1 min in future, within 5 min window
 		ID:        "ok-id",
 	}
-	if err := ss.setItem(okItem); err != nil {
+	if err := ss.setItem(ctx, okItem, ss.notifyListeners); err != nil {
 		t.Fatalf("expected no error for item within skew, got: %v", err)
+	}
+}
+
+func TestTimestampBoundsCheck_ProductionOffset(t *testing.T) {
+	store := newMemStore()
+	ss := New(store) // default 10s offset
+	defer ss.Close()
+	ctx := context.Background()
+
+	// An item within the allowed skew should succeed with production offset.
+	okItem := SyncStoreItem{
+		Key:       "ok-key",
+		Value:     "ok-value",
+		Timestamp: time.Now().UnixNano() + int64(1*time.Minute),
+		ID:        "ok-id",
+	}
+	if err := ss.setItem(ctx, okItem, ss.notifyListeners); err != nil {
+		t.Fatalf("expected no error for item within skew, got: %v", err)
+	}
+
+	// An item far in the future should still be rejected.
+	futureItem := SyncStoreItem{
+		Key:       "future-key",
+		Value:     "future-value",
+		Timestamp: time.Now().UnixNano() + int64(10*time.Minute) + 10_000_000_000, // beyond skew + offset
+		ID:        "future-id",
+	}
+	if err := ss.setItem(ctx, futureItem, ss.notifyListeners); err == nil {
+		t.Fatal("expected error for future timestamp with production offset, got nil")
 	}
 }
 
@@ -1189,6 +1226,9 @@ func TestSyncOutFilter_CursorAdvancesPastFilteredItems(t *testing.T) {
 	if len(p1.Items) != 1 || p1.Items[0].Key != "visible" {
 		t.Fatalf("expected [visible], got %v", p1.Items)
 	}
+	if err := ss.AckSyncOut(ctx, "peer1", p1); err != nil {
+		t.Fatal(err)
+	}
 
 	// Second sync: cursor should have advanced past both items
 	p2, err := ss.SyncOut(ctx, "peer1", 0)
@@ -1435,8 +1475,11 @@ func TestPostSyncOut_Called(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := ss.SyncOut(ctx, "target-peer", 0)
+	payload, err := ss.SyncOut(ctx, "target-peer", 0)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.AckSyncOut(ctx, "target-peer", payload); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1464,8 +1507,11 @@ func TestPostSyncOut_NotCalledWhenEmpty(t *testing.T) {
 	ctx := context.Background()
 
 	// No items written — SyncOut should not trigger PostSyncOut
-	_, err := ss.SyncOut(ctx, "peer1", 0)
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.AckSyncOut(ctx, "peer1", payload); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1493,8 +1539,11 @@ func TestPostSyncOut_MultipleCallbacks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := ss.SyncOut(ctx, "peer1", 0)
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.AckSyncOut(ctx, "peer1", payload); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1611,6 +1660,9 @@ func TestSyncOut_CursorSafety_MultiInstance(t *testing.T) {
 	}
 	if len(payload1.Items) != 1 || payload1.Items[0].Key != "item-2" {
 		t.Fatalf("expected [item-2], got %v", payload1.Items)
+	}
+	if err := ss.AckSyncOut(ctx, "remote-peer", payload1); err != nil {
+		t.Fatal(err)
 	}
 
 	// Simulate Instance A committing item-1 AFTER the SyncOut above.
@@ -1827,4 +1879,774 @@ func TestOnSyncComplete_Hook(t *testing.T) {
 		t.Fatalf("expected 2 items out, got %d", calls[0].out)
 	}
 	mu.Unlock()
+}
+
+// TestProductionOffset verifies sync works correctly with the default 10-second
+// offset. Items are included in SyncOut immediately, but the cursor does NOT
+// advance past them until their WriteTimestamp has matured (current time >= WT).
+// This ensures immature items are re-sent on subsequent SyncOut calls until the
+// window closes, preventing missed items from concurrent writers.
+func TestProductionOffset(t *testing.T) {
+	store := newTestStore()
+	ss := New(store) // uses default 10-second offset
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write an item — its WriteTimestamp will be ~10s in the future.
+	if err := ss.SetItem(ctx, "app", "key1", "value1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// SyncOut includes the item immediately (it's in the queue).
+	payload, err := ss.SyncOut(ctx, "peer1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(payload.Items))
+	}
+
+	// Cursor should NOT have advanced (WriteTimestamp is still in the future).
+	// Ack and re-sync: the same item should appear again.
+	if err := ss.AckSyncOut(ctx, "peer1", payload); err != nil {
+		t.Fatal(err)
+	}
+	payload2, err := ss.SyncOut(ctx, "peer1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload2.Items) != 1 {
+		t.Fatalf("expected 1 item again (cursor not advanced past immature WT), got %d", len(payload2.Items))
+	}
+
+	// The item should be readable via Get (view layer is immediate).
+	val, err := ss.Get(ctx, "key1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "value1" {
+		t.Fatalf("expected value1, got %s", val)
+	}
+}
+
+// TestWithMaxClockSkew verifies the WithMaxClockSkew option rejects items
+// with timestamps beyond the configured skew.
+func TestWithMaxClockSkew(t *testing.T) {
+	store := newTestStore()
+	ss := NewWithOptions(store, WithTimeOffset(int64(100*time.Millisecond)), WithMaxClockSkew(1*time.Second))
+	defer ss.Close()
+	ctx := context.Background()
+
+	// A normal write should succeed.
+	if err := ss.SetItem(ctx, "app", "key1", "value1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A SyncIn item with a timestamp far in the future should be rejected.
+	futureItem := SyncStoreItem{
+		App:       "app",
+		Key:       "key2",
+		Value:     "value2",
+		Timestamp: time.Now().UnixNano() + int64(10*time.Second), // 10s in the future
+		ID:        "future-id",
+	}
+	err := ss.SyncIn(ctx, "peer1", SyncPayload{Items: []SyncStoreItem{futureItem}})
+	if err == nil {
+		t.Fatal("expected error for future timestamp, got nil")
+	}
+	if !strings.Contains(err.Error(), "clock skew") {
+		t.Fatalf("expected clock skew error, got: %v", err)
+	}
+}
+
+// --- PreSetItem hook tests ---
+
+func TestPreSetItem_ModifiesItem(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPreSetItem(func(item *SyncStoreItem) {
+			item.PublicKey = "my-pub-key"
+			item.Signature = "my-sig"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "app", "signed-key", "signed-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	item, err := ss.GetItem(ctx, "signed-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.PublicKey != "my-pub-key" {
+		t.Fatalf("expected PublicKey 'my-pub-key', got %q", item.PublicKey)
+	}
+	if item.Signature != "my-sig" {
+		t.Fatalf("expected Signature 'my-sig', got %q", item.Signature)
+	}
+}
+
+func TestPreSetItem_MultipleHooks_Chain(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPreSetItem(func(item *SyncStoreItem) {
+			item.Value = item.Value + "-hook1"
+		}),
+		WithPreSetItem(func(item *SyncStoreItem) {
+			item.Value = item.Value + "-hook2"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "", "chain", "base"); err != nil {
+		t.Fatal(err)
+	}
+
+	item, err := ss.GetItem(ctx, "chain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Value != "base-hook1-hook2" {
+		t.Fatalf("expected 'base-hook1-hook2', got %q", item.Value)
+	}
+}
+
+func TestPreSetItem_SyncInAlsoApplies(t *testing.T) {
+	store := newMemStore()
+	var hookCalled bool
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithPreSetItem(func(item *SyncStoreItem) {
+			hookCalled = true
+			item.Signature = "verified"
+		}),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload := SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "remote", Value: "val", Timestamp: time.Now().UnixNano(), ID: "remote-id"},
+		},
+	}
+	if err := ss.SyncIn(ctx, "peer1", payload); err != nil {
+		t.Fatal(err)
+	}
+
+	if !hookCalled {
+		t.Fatal("PreSetItem hook should be called during SyncIn")
+	}
+	item, err := ss.GetItem(ctx, "remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Signature != "verified" {
+		t.Fatalf("expected Signature 'verified', got %q", item.Signature)
+	}
+}
+
+// --- WithLogger tests ---
+
+// logCapture is a slog.Handler that captures log records.
+type logCapture struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *logCapture) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *logCapture) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r)
+	return nil
+}
+func (h *logCapture) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *logCapture) WithGroup(_ string) slog.Handler      { return h }
+
+func (h *logCapture) find(msg string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Message == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWithLogger(t *testing.T) {
+	store := newMemStore()
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithLogger(logger),
+	)
+
+	// Close should log "store sync closed"
+	ss.Close()
+
+	if !capture.find("store sync closed") {
+		t.Fatal("expected 'store sync closed' log message from custom logger")
+	}
+}
+
+func TestWithLogger_StaleWriteLogged(t *testing.T) {
+	store := newMemStore()
+	capture := &logCapture{}
+	logger := slog.New(capture)
+
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithLogger(logger),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write an item with a future timestamp so the next SetItem is stale.
+	futureItem := SyncStoreItem{
+		App:       "app",
+		Key:       "k",
+		Value:     "future",
+		Timestamp: time.Now().UnixNano() + int64(2*time.Minute),
+		ID:        "future-id",
+	}
+	if err := ss.setItem(ctx, futureItem, ss.notifyListeners); err != nil {
+		t.Fatal(err)
+	}
+
+	// This SetItem should be silently skipped (stale) and logged.
+	if err := ss.SetItem(ctx, "app", "k", "older"); err != nil {
+		t.Fatal(err)
+	}
+
+	if !capture.find("stale write skipped") {
+		t.Fatal("expected 'stale write skipped' debug log")
+	}
+}
+
+// --- WithGCWorkers tests ---
+
+func TestWithGCWorkers_Disabled(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(100*time.Millisecond)),
+		WithGCWorkers(0),
+	)
+
+	ctx := context.Background()
+	// Writes should still work with GC disabled.
+	if err := ss.SetItem(ctx, "", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	item, err := ss.GetItem(ctx, "k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Value != "v1" {
+		t.Fatalf("expected v1, got %q", item.Value)
+	}
+
+	// Close should not hang.
+	done := make(chan struct{})
+	go func() {
+		ss.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() hung with 0 GC workers")
+	}
+}
+
+func TestWithGCWorkers_Custom(t *testing.T) {
+	store := newMemStore()
+	ss := NewWithOptions(store,
+		WithTimeOffset(int64(10*time.Second)),
+		WithGCWorkers(1),
+	)
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write first value, then overwrite. GC with 1 worker should still clean up.
+	if err := ss.SetItem(ctx, "", "gk", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	item1, _ := ss.GetItem(ctx, "gk")
+	firstID := item1.ID
+
+	time.Sleep(time.Millisecond)
+	if err := ss.SetItem(ctx, "", "gk", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for GC.
+	time.Sleep(200 * time.Millisecond)
+
+	_, err := store.Get(ctx, ValueKey(firstID))
+	if !errors.Is(err, storemd.ErrNotFound) {
+		t.Errorf("expected old value cleaned up by single GC worker, got err=%v", err)
+	}
+}
+
+// --- Sync() method tests ---
+
+func TestSync_InitiateWithNil(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.SetItem(ctx, "app", "k1", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync with nil incoming should return queued items.
+	payload, err := ss.Sync(ctx, "peer1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload == nil || len(payload.Items) != 1 {
+		t.Fatalf("expected 1 item from Sync(nil), got %v", payload)
+	}
+	if payload.Items[0].Key != "k1" {
+		t.Fatalf("expected key k1, got %q", payload.Items[0].Key)
+	}
+}
+
+func TestSync_EchoBackFiltering(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	ts := time.Now().UnixNano()
+	incoming := &SyncPayload{
+		Items: []SyncStoreItem{
+			{Key: "echo-key", Value: "echo-val", Timestamp: ts, ID: "echo-id"},
+		},
+	}
+
+	// Sync with incoming: the item should be written but NOT echoed back.
+	payload, err := ss.Sync(ctx, "peer1", incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The synced-in item should not appear in the response (echo-back filtering).
+	if payload != nil {
+		for _, item := range payload.Items {
+			if item.ID == "echo-id" && item.Timestamp == ts {
+				t.Fatal("item was echoed back to the sender — echo-back filtering failed")
+			}
+		}
+	}
+
+	// The item should still be persisted.
+	item, err := ss.GetItem(ctx, "echo-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Value != "echo-val" {
+		t.Fatalf("expected echo-val, got %q", item.Value)
+	}
+}
+
+func TestSync_ReturnsNilWhenEmpty(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	payload, err := ss.Sync(ctx, "peer1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload != nil {
+		t.Fatalf("expected nil payload when no items to send, got %+v", payload)
+	}
+}
+
+func TestSync_FullExchange(t *testing.T) {
+	store1 := newTestSyncStore()
+	defer store1.Close()
+	store2 := newTestSyncStore()
+	defer store2.Close()
+	ctx := context.Background()
+
+	// Store1 writes data.
+	if err := store1.SetItem(ctx, "app", "s1-key", "s1-val"); err != nil {
+		t.Fatal(err)
+	}
+	// Store2 writes data.
+	if err := store2.SetItem(ctx, "app", "s2-key", "s2-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Store1 initiates sync: gets its own items to send.
+	out1, err := store1.Sync(ctx, "store2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1 == nil {
+		t.Fatal("expected items from store1")
+	}
+
+	// Store2 receives store1's items and responds with its own.
+	out2, err := store2.Sync(ctx, "store1", out1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Store2 should now have store1's data.
+	val, err := store2.Get(ctx, "s1-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "s1-val" {
+		t.Fatalf("expected s1-val, got %q", val)
+	}
+
+	// Store1 receives store2's response.
+	if out2 != nil {
+		_, err = store1.Sync(ctx, "store2", out2)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Store1 should now have store2's data.
+	val, err = store1.Get(ctx, "s2-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "s2-val" {
+		t.Fatalf("expected s2-val, got %q", val)
+	}
+}
+
+// --- New feature tests ---
+
+func TestNotifyListeners_ConcurrentUnsubscribe(t *testing.T) {
+	// Verify that unsubscribing from inside a listener callback doesn't
+	// deadlock or panic, thanks to the snapshot pattern.
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	var unsub func()
+	var called bool
+	unsub = ss.OnUpdate(func(item SyncStoreItem) {
+		called = true
+		unsub() // unsubscribe from within the callback
+	})
+
+	if err := ss.SetItem(ctx, "", "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("listener should have been called")
+	}
+
+	// Second write should not invoke the unsubscribed listener.
+	called = false
+	if err := ss.SetItem(ctx, "", "k2", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("unsubscribed listener should not be called")
+	}
+}
+
+func TestNotifyListeners_SubscribeFromCallback(t *testing.T) {
+	// Verify that subscribing a new listener from within a callback
+	// doesn't deadlock (the new listener won't fire for the current event).
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	var innerCalled bool
+	ss.OnUpdate(func(item SyncStoreItem) {
+		// Register a new listener from within the callback.
+		ss.OnUpdate(func(item SyncStoreItem) {
+			innerCalled = true
+		})
+	})
+
+	if err := ss.SetItem(ctx, "", "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	// The inner listener was registered during the first notification,
+	// so it should fire on the next write.
+	if err := ss.SetItem(ctx, "", "k2", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if !innerCalled {
+		t.Fatal("inner listener registered from callback should fire on subsequent writes")
+	}
+}
+
+// failingStore wraps a memStore and can be configured to fail specific operations.
+type failingStore struct {
+	*memStore
+	failValueKeySet bool
+}
+
+func (f *failingStore) Set(ctx context.Context, key, value string) error {
+	if f.failValueKeySet && strings.HasPrefix(key, "%sync%value%") {
+		return fmt.Errorf("injected ValueKey write failure")
+	}
+	return f.memStore.Set(ctx, key, value)
+}
+
+func TestSetItem_ValueKeyFailure_RestoresViewKey(t *testing.T) {
+	inner := newMemStore()
+	store := &failingStore{memStore: inner}
+	ss := New(store, int64(100*time.Millisecond))
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write an initial value successfully.
+	if err := ss.SetItem(ctx, "", "restore-key", "original"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now make ValueKey writes fail.
+	store.failValueKeySet = true
+	time.Sleep(time.Millisecond)
+
+	// Attempt to overwrite — should fail.
+	err := ss.SetItem(ctx, "", "restore-key", "overwrite")
+	if err == nil {
+		t.Fatal("expected error from failing ValueKey write")
+	}
+
+	// Re-enable writes to verify state.
+	store.failValueKeySet = false
+
+	// The original value should still be intact (ViewKey restored).
+	val, getErr := ss.Get(ctx, "restore-key")
+	if getErr != nil {
+		t.Fatalf("Get after failed overwrite: %v", getErr)
+	}
+	if val != "original" {
+		t.Fatalf("expected 'original' after rollback, got %q", val)
+	}
+}
+
+func TestSetItem_ValueKeyFailure_NewKey_CleansUp(t *testing.T) {
+	inner := newMemStore()
+	store := &failingStore{memStore: inner}
+	ss := New(store, int64(100*time.Millisecond))
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Make ValueKey writes fail from the start.
+	store.failValueKeySet = true
+
+	err := ss.SetItem(ctx, "", "new-fail-key", "val")
+	if err == nil {
+		t.Fatal("expected error from failing ValueKey write")
+	}
+
+	// Re-enable writes.
+	store.failValueKeySet = false
+
+	// The key should not exist (ViewKey was cleaned up).
+	_, getErr := ss.Get(ctx, "new-fail-key")
+	if !errors.Is(getErr, storemd.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for cleaned-up key, got %v", getErr)
+	}
+}
+
+func TestGcKey_RespectsContextCancellation(t *testing.T) {
+	store := newMemStore()
+	ss := New(store, int64(100*time.Millisecond))
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write several items to create queue entries.
+	for i := range 5 {
+		if err := ss.SetItem(ctx, "", fmt.Sprintf("gc-ctx-key-%d", i), "v"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Calling gcKey with a cancelled context should not panic and should
+	// exit gracefully without fully completing (or at least not error).
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// This should not panic or hang.
+	ss.gcKey(cancelledCtx, "gc-ctx-key-0", "nonexistent-id")
+}
+
+// --- MaxSyncOutLimit test ---
+
+func TestSyncOut_DefaultLimit(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Write items and verify SyncOut respects the default limit when 0 is passed.
+	for i := range 5 {
+		if err := ss.SetItem(ctx, "", fmt.Sprintf("limit-key-%d", i), "v"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	payload, err := ss.SyncOut(ctx, "peer1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 5 {
+		t.Fatalf("expected 5 items with default limit, got %d", len(payload.Items))
+	}
+}
+
+// --- Delete edge cases ---
+
+func TestDelete_NonExistentKey(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	err := ss.Delete(ctx, "does-not-exist")
+	if !errors.Is(err, storemd.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for non-existent key, got %v", err)
+	}
+}
+
+func TestDelete_SyncsToRemote(t *testing.T) {
+	store1 := newTestSyncStore()
+	defer store1.Close()
+	store2 := newTestSyncStore()
+	defer store2.Close()
+	ctx := context.Background()
+
+	// Set and sync to store2.
+	if err := store1.SetItem(ctx, "", "del-key", "val"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	p, err := store1.SyncOut(ctx, "store2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store2.SyncIn(ctx, "store1", *p); err != nil {
+		t.Fatal(err)
+	}
+	if err := store1.AckSyncOut(ctx, "store2", p); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete on store1.
+	if err := store1.Delete(ctx, "del-key"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Sync the tombstone to store2.
+	p2, err := store1.SyncOut(ctx, "store2", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store2.SyncIn(ctx, "store1", *p2); err != nil {
+		t.Fatal(err)
+	}
+
+	// store2 should see the key as deleted.
+	_, err = store2.Get(ctx, "del-key")
+	if !errors.Is(err, storemd.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after synced delete, got %v", err)
+	}
+}
+
+// --- List through storemd.Store interface ---
+
+func TestList_StoreInterface(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	for _, k := range []string{"list/a", "list/b", "list/c", "other"} {
+		if err := ss.Set(ctx, k, "v-"+k); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	list, err := ss.List(ctx, storemd.ListArgs{Prefix: "list/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("expected 3 items with prefix 'list/', got %d", len(list))
+	}
+}
+
+func TestList_ExcludesDeleted(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	if err := ss.Set(ctx, "alive", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.Set(ctx, "dead", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := ss.Delete(ctx, "dead"); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := ss.List(ctx, storemd.ListArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].Key != "alive" {
+		t.Fatalf("expected [alive], got %v", list)
+	}
+}
+
+// --- SetIfNotExists edge case: reclaim tombstone ---
+
+func TestSetIfNotExists_ReclaimsTombstone(t *testing.T) {
+	ss := newTestSyncStore()
+	defer ss.Close()
+	ctx := context.Background()
+
+	// Create and delete a key to leave a tombstone.
+	if err := ss.Set(ctx, "tomb-key", "old"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := ss.Delete(ctx, "tomb-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	// SetIfNotExists should detect the tombstone and reclaim it via SetItem.
+	ok, err := ss.SetIfNotExists(ctx, "tomb-key", "new")
+	if err != nil {
+		t.Fatalf("SetIfNotExists on tombstone: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected true when reclaiming a tombstoned key")
+	}
+
+	val, err := ss.Get(ctx, "tomb-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if val != "new" {
+		t.Fatalf("expected 'new', got %q", val)
+	}
 }

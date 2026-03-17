@@ -129,6 +129,10 @@ func (es *EncryptedSync) OnUpdate(fn core.UpdateListener) func() {
 	return es.inner.OnUpdate(fn)
 }
 
+func (es *EncryptedSync) AckSyncOut(ctx context.Context, peerID string, payload *core.SyncPayload) error {
+	return es.inner.AckSyncOut(ctx, peerID, payload)
+}
+
 func (es *EncryptedSync) Close() error {
 	return es.inner.Close()
 }

@@ -105,5 +105,13 @@ func (t *HTTPTransport) Serve(w http.ResponseWriter, r *http.Request, peerID str
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(client.Message{Type: "sync", Payload: response})
+	if err := json.NewEncoder(w).Encode(client.Message{Type: "sync", Payload: response}); err != nil {
+		return err
+	}
+
+	// Advance the cursor only after the response has been written successfully.
+	if err := store.AckSyncOut(ctx, peerID, response); err != nil {
+		logger.Error("ack sync out error", "peer", peerID, "err", err)
+	}
+	return nil
 }

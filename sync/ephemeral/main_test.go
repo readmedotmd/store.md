@@ -233,6 +233,11 @@ func TestSyncOutFilter_CursorAdvancesPastFiltered(t *testing.T) {
 		t.Fatal("expected normal item in nodeC payload")
 	}
 
+	// Ack delivery so cursor advances.
+	if err := ss.AckSyncOut(ctx, "nodeC", payloadC); err != nil {
+		t.Fatal(err)
+	}
+
 	// Second sync for nodeC should return nil (cursor advanced past everything)
 	payload2, err := ss.Sync(ctx, "nodeC", nil)
 	if err != nil {
@@ -384,9 +389,15 @@ func TestPostSyncOut_DeletesDelivered(t *testing.T) {
 	}
 
 	// SyncOut to nodeB — this triggers postSyncOut which deletes the items
-	_, err := ss.Sync(ctx, "nodeB", nil)
+	payload, err := ss.Sync(ctx, "nodeB", nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Ack delivery to trigger postSyncOut cleanup.
+	if payload != nil {
+		if err := ss.AckSyncOut(ctx, "nodeB", payload); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Verify ephemeral items are cleaned up from store
@@ -469,6 +480,10 @@ func TestFullRoundTrip(t *testing.T) {
 	}
 	if outPayload == nil {
 		t.Fatal("expected outgoing payload")
+	}
+	// Ack delivery to trigger postSyncOut cleanup on A.
+	if err := ssA.AckSyncOut(ctx, "nodeB", outPayload); err != nil {
+		t.Fatal(err)
 	}
 
 	// 3. B processes
@@ -837,6 +852,10 @@ func TestInMemoryStore_NoResidualData(t *testing.T) {
 	if out == nil {
 		t.Fatal("expected payload")
 	}
+	// Ack delivery to trigger postSyncOut cleanup on A.
+	if err := ssA.AckSyncOut(ctx, "nodeB", out); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = ssB.Sync(ctx, "nodeA", out)
 	if err != nil {
@@ -966,6 +985,10 @@ func TestOnDelivered_Hook(t *testing.T) {
 	}
 	if out == nil {
 		t.Fatal("expected sync payload")
+	}
+	// Ack delivery to trigger postSyncOut (OnDelivered).
+	if err := ssA.AckSyncOut(ctx, "nodeB", out); err != nil {
+		t.Fatal(err)
 	}
 
 	mu.Lock()
