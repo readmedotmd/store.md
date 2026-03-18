@@ -316,6 +316,92 @@ func TestSyncRoundTrip_CrossStore(t *testing.T) {
 	}
 }
 
+func TestGC_DeletesExpiredKeys(t *testing.T) {
+	ss := newTestSyncStore(t)
+	ttl := 50 * time.Millisecond
+	a := New(ss, "a", WithTTL(ttl), WithGCInterval(20*time.Millisecond))
+	t.Cleanup(func() { a.Close() })
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	ctx := context.Background()
+	if _, err := a.Send(ctx, "b", "ping", "hello"); err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+
+	// Keys should exist immediately after Send.
+	pairs, err := ss.List(ctx, storemd.ListArgs{Prefix: "%msg%"})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(pairs) == 0 {
+		t.Fatal("expected msg keys to exist before TTL expires")
+	}
+
+	// Wait for TTL + at least one GC tick.
+	time.Sleep(ttl + 60*time.Millisecond)
+
+	pairs, err = ss.List(ctx, storemd.ListArgs{Prefix: "%msg%"})
+	if err != nil {
+		t.Fatalf("List after GC failed: %v", err)
+	}
+	if len(pairs) != 0 {
+		t.Fatalf("expected all msg keys to be deleted by GC, got %d", len(pairs))
+	}
+}
+
+func TestGC_SkipsZeroCreatedAt(t *testing.T) {
+	ss := newTestSyncStore(t)
+	ttl := 20 * time.Millisecond
+	a := New(ss, "a", WithTTL(ttl), WithGCInterval(10*time.Millisecond))
+	t.Cleanup(func() { a.Close() })
+
+	// Write a legacy envelope (no CreatedAt) directly.
+	env := Envelope{MessageID: "legacy-1", SenderID: "x", Type: "ping", Data: "d"}
+	encoded, _ := json.Marshal(env)
+	ctx := context.Background()
+	ss.SetItem(ctx, "msg", reqKey("a", "legacy-1"), string(encoded))
+
+	// Wait past TTL.
+	time.Sleep(ttl + 40*time.Millisecond)
+
+	pairs, err := ss.List(ctx, storemd.ListArgs{Prefix: "%msg%"})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(pairs) == 0 {
+		t.Fatal("expected legacy key to be preserved (zero CreatedAt must not be GC'd)")
+	}
+}
+
+func TestGC_OffByDefault(t *testing.T) {
+	ss := newTestSyncStore(t)
+	a := newTestMessageStore(t, ss, "a") // no options — GC off
+	b := newTestMessageStore(t, ss, "b")
+
+	b.Handle("ping", func(msg Envelope) (string, error) {
+		return "pong", nil
+	})
+
+	ctx := context.Background()
+	if _, err := a.Send(ctx, "b", "ping", "hello"); err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	pairs, err := ss.List(ctx, storemd.ListArgs{Prefix: "%msg%"})
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(pairs) == 0 {
+		t.Fatal("expected msg keys to persist when GC is off")
+	}
+}
+
 func TestID(t *testing.T) {
 	ss := newTestSyncStore(t)
 	m := newTestMessageStore(t, ss, "my-store-id")

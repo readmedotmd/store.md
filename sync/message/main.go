@@ -6,6 +6,7 @@ import (
 	"errors"
 	gosync "sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	storemd "github.com/readmedotmd/store.md"
@@ -19,6 +20,27 @@ type Envelope struct {
 	Type      string `json:"type"`
 	Data      string `json:"data"`
 	Error     string `json:"error,omitempty"`
+	// CreatedAt is Unix nanoseconds. Zero means the envelope predates TTL
+	// support and will be skipped by garbage collection.
+	CreatedAt int64 `json:"createdAt,omitempty"`
+}
+
+// Option configures a StoreMessage.
+type Option func(*StoreMessage)
+
+// WithTTL enables TTL-based garbage collection. When set, a background
+// goroutine periodically scans req and res keys and deletes those whose
+// CreatedAt timestamp is older than ttl. GC is off by default.
+// Envelopes written before TTL support was added (CreatedAt == 0) are
+// skipped and must be cleaned up manually if desired.
+func WithTTL(ttl time.Duration) Option {
+	return func(m *StoreMessage) { m.gcTTL = ttl }
+}
+
+// WithGCInterval sets how often the GC scan runs when TTL is enabled.
+// Defaults to the TTL value itself when not provided.
+func WithGCInterval(interval time.Duration) Option {
+	return func(m *StoreMessage) { m.gcInterval = interval }
 }
 
 // Handler processes an incoming message and returns a response payload.
@@ -59,6 +81,11 @@ const (
 //
 // Multiple hooks are called in registration order. Each hook receives the
 // output of the previous hook (chained transformation).
+//
+// # Garbage collection
+//
+// By default, req and res keys accumulate indefinitely. Use [WithTTL] to
+// enable background GC. See [WithGCInterval] to control the scan frequency.
 type StoreMessage struct {
 	ss *core.StoreSync
 	id string
@@ -69,21 +96,27 @@ type StoreMessage struct {
 	pendingMu gosync.Mutex
 	pending   map[string]chan Envelope
 
-	listenersMu   gosync.RWMutex
+	listenersMu    gosync.RWMutex
 	listeners      map[uint64]MessageListener
 	nextListenerID atomic.Uint64
 
 	sendCompleteMu   gosync.RWMutex
-	sendCompleteList  map[uint64]func(env Envelope, response string) string
+	sendCompleteList map[uint64]func(env Envelope, response string) string
 	sendErrorMu      gosync.RWMutex
-	sendErrorList     map[uint64]func(env Envelope, err error) error
+	sendErrorList    map[uint64]func(env Envelope, err error) error
 	nextHookID       atomic.Uint64
+
+	gcTTL      time.Duration
+	gcInterval time.Duration
+	gcStop     chan struct{}
 
 	unsub func()
 }
 
 // New creates a StoreMessage with the given unique ID.
-func New(syncStore *core.StoreSync, id string) *StoreMessage {
+// Optional [Option] values may be passed to configure behaviour such as
+// TTL-based garbage collection (see [WithTTL]).
+func New(syncStore *core.StoreSync, id string, opts ...Option) *StoreMessage {
 	m := &StoreMessage{
 		ss:               syncStore,
 		id:               id,
@@ -93,7 +126,18 @@ func New(syncStore *core.StoreSync, id string) *StoreMessage {
 		sendCompleteList: make(map[uint64]func(env Envelope, response string) string),
 		sendErrorList:    make(map[uint64]func(env Envelope, err error) error),
 	}
+	for _, o := range opts {
+		o(m)
+	}
 	m.unsub = syncStore.OnUpdate(m.onSyncUpdate)
+	if m.gcTTL > 0 {
+		interval := m.gcInterval
+		if interval == 0 {
+			interval = m.gcTTL
+		}
+		m.gcStop = make(chan struct{})
+		go m.runGC(interval)
+	}
 	return m
 }
 
@@ -107,8 +151,13 @@ func (m *StoreMessage) SyncStore() *core.StoreSync {
 	return m.ss
 }
 
-// Close unsubscribes from the sync store and cancels any pending sends.
+// Close unsubscribes from the sync store, stops the GC goroutine (if
+// running), and cancels any pending sends.
 func (m *StoreMessage) Close() error {
+	if m.gcStop != nil {
+		close(m.gcStop)
+		m.gcStop = nil
+	}
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
@@ -208,6 +257,7 @@ func (m *StoreMessage) Send(ctx context.Context, targetID, msgType, data string)
 		SenderID:  m.id,
 		Type:      msgType,
 		Data:      data,
+		CreatedAt: time.Now().UnixNano(),
 	}
 	encoded, err := json.Marshal(env)
 	if err != nil {
@@ -260,6 +310,7 @@ func (m *StoreMessage) sendResponse(messageID, data, errMsg string) error {
 		SenderID:  m.id,
 		Data:      data,
 		Error:     errMsg,
+		CreatedAt: time.Now().UnixNano(),
 	}
 	encoded, err := json.Marshal(env)
 	if err != nil {
@@ -354,6 +405,46 @@ func (m *StoreMessage) notifyMessageListeners(env Envelope) {
 	m.listenersMu.RUnlock()
 	for _, fn := range listeners {
 		fn(env)
+	}
+}
+
+// runGC runs the GC loop, ticking every interval until gcStop is closed.
+func (m *StoreMessage) runGC(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.gc()
+		case <-m.gcStop:
+			return
+		}
+	}
+}
+
+// gc scans req and res key prefixes and deletes entries older than gcTTL.
+// Envelopes with a zero CreatedAt (written before TTL support) are skipped.
+func (m *StoreMessage) gc() {
+	ctx := context.Background()
+	cutoff := time.Now().Add(-m.gcTTL).UnixNano()
+
+	for _, prefix := range []string{reqPrefix, resPrefix} {
+		pairs, err := m.ss.List(ctx, storemd.ListArgs{Prefix: prefix})
+		if err != nil {
+			continue
+		}
+		for _, p := range pairs {
+			var env Envelope
+			if err := json.Unmarshal([]byte(p.Value), &env); err != nil {
+				continue
+			}
+			if env.CreatedAt == 0 {
+				continue // no timestamp — skip rather than delete
+			}
+			if env.CreatedAt < cutoff {
+				m.ss.Delete(ctx, p.Key) //nolint:errcheck
+			}
+		}
 	}
 }
 
