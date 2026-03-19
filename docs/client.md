@@ -15,11 +15,14 @@ type Connection interface {
 }
 ```
 
-Three implementations are provided:
+Four implementations are provided:
 
 - **`Dial`** — creates a client-side WebSocket connection (default)
 - **`NewConn`** — wraps an already-upgraded `*websocket.Conn` (used by the server package)
 - **`HTTPDialer`** — creates an HTTP POST-based connection for environments without WebSocket
+- **`SSEDialer`** — creates an SSE-based connection (server push via event stream, client writes via POST)
+
+See [transport.md](transport.md) for a comprehensive guide to all three transports with examples.
 
 ## Quick Start
 

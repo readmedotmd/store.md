@@ -191,7 +191,55 @@ func (s *Server) EnableHTTP() {
 	s.AddTransport(&HTTPTransport{})
 }
 
-// TokenAuth returns an Authorizer that validates Bearer tokens.
+// EnableSSE adds a Server-Sent Events transport so the server can push
+// sync updates over an SSE stream and accept sync messages via POST.
+//
+// After calling EnableSSE, the server's ServeHTTP auto-dispatch will
+// route GET requests with Accept: text/event-stream and POST requests
+// with X-Transport: sse to the SSE transport.
+//
+// For route-based dispatch, use [Server.Handler] with [Server.SSE] instead.
+func (s *Server) EnableSSE() {
+	s.AddTransport(&SSETransport{})
+}
+
+// WebSocket returns the server's WebSocket transport instance.
+// Returns nil if no WebSocket transport is configured.
+func (s *Server) WebSocket() *WebSocketTransport {
+	return s.wsTransport
+}
+
+// HTTP returns a new [HTTPTransport] for use with [Server.Handler].
+// Each call returns a new instance; the transport is stateless.
+func (s *Server) HTTP() *HTTPTransport {
+	return &HTTPTransport{}
+}
+
+// SSE returns a new [SSETransport] for use with [Server.Handler].
+// Each call returns a new instance with its own session map.
+func (s *Server) SSE() *SSETransport {
+	return &SSETransport{}
+}
+
+// Handler returns an http.Handler for a specific transport. This allows
+// mounting transports on separate routes in a standard Go HTTP mux:
+//
+//	mux.Handle("/ws", srv.Handler(srv.WebSocket()))
+//	mux.Handle("/sse", srv.Handler(srv.SSE()))
+//	mux.Handle("/http", srv.Handler(srv.HTTP()))
+//
+// The returned handler performs authentication, connection tracking, and
+// hook invocation, then delegates to the transport. Unlike ServeHTTP
+// (which auto-selects a transport via CanHandle), this handler always
+// uses the specified transport.
+func (s *Server) Handler(t Transport) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serveWithTransport(t, w, r)
+	})
+}
+
+// TokenAuth returns an Authorizer that validates Bearer tokens from the
+// Authorization header.
 func TokenAuth(tokens map[string]string) Authorizer {
 	return func(r *http.Request) (string, error) {
 		auth := r.Header.Get("Authorization")
@@ -207,6 +255,39 @@ func TokenAuth(tokens map[string]string) Authorizer {
 	}
 }
 
+// TokenAuthWithParam returns an Authorizer that checks for a Bearer token
+// in the Authorization header first, then falls back to a URL query
+// parameter. This is useful for browser clients where the WebSocket API
+// does not support custom HTTP headers.
+//
+// Example:
+//
+//	// Accepts both:
+//	//   Authorization: Bearer my-token
+//	//   ws://host/sync?token=my-token
+//	auth := server.TokenAuthWithParam("token", tokens)
+//	srv := server.New(ss, auth)
+func TokenAuthWithParam(param string, tokens map[string]string) Authorizer {
+	return func(r *http.Request) (string, error) {
+		// Check Authorization header first.
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token := strings.TrimPrefix(auth, "Bearer ")
+			if peerID, ok := tokens[token]; ok {
+				return peerID, nil
+			}
+			return "", fmt.Errorf("invalid token")
+		}
+		// Fall back to query parameter.
+		if token := r.URL.Query().Get(param); token != "" {
+			if peerID, ok := tokens[token]; ok {
+				return peerID, nil
+			}
+			return "", fmt.Errorf("invalid token")
+		}
+		return "", fmt.Errorf("missing or invalid Authorization header")
+	}
+}
+
 // TokenAuthWithExpiry returns an Authorizer that validates Bearer tokens with
 // optional expiration support.
 func TokenAuthWithExpiry(tokens map[string]TokenInfo) Authorizer {
@@ -216,15 +297,37 @@ func TokenAuthWithExpiry(tokens map[string]TokenInfo) Authorizer {
 			return "", fmt.Errorf("missing or invalid Authorization header")
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
-		info, ok := tokens[token]
-		if !ok {
-			return "", fmt.Errorf("invalid token")
-		}
-		if !info.ExpiresAt.IsZero() && time.Now().After(info.ExpiresAt) {
-			return "", fmt.Errorf("token expired")
-		}
-		return info.PeerID, nil
+		return validateTokenWithExpiry(tokens, token)
 	}
+}
+
+// TokenAuthWithExpiryAndParam returns an Authorizer that validates Bearer
+// tokens with expiration, checking the Authorization header first, then
+// falling back to a URL query parameter. Combines [TokenAuthWithExpiry]
+// header validation with [TokenAuthWithParam] query parameter fallback.
+func TokenAuthWithExpiryAndParam(param string, tokens map[string]TokenInfo) Authorizer {
+	return func(r *http.Request) (string, error) {
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token := strings.TrimPrefix(auth, "Bearer ")
+			return validateTokenWithExpiry(tokens, token)
+		}
+		if token := r.URL.Query().Get(param); token != "" {
+			return validateTokenWithExpiry(tokens, token)
+		}
+		return "", fmt.Errorf("missing or invalid Authorization header")
+	}
+}
+
+// validateTokenWithExpiry looks up a token and checks its expiration.
+func validateTokenWithExpiry(tokens map[string]TokenInfo, token string) (string, error) {
+	info, ok := tokens[token]
+	if !ok {
+		return "", fmt.Errorf("invalid token")
+	}
+	if !info.ExpiresAt.IsZero() && time.Now().After(info.ExpiresAt) {
+		return "", fmt.Errorf("token expired")
+	}
+	return info.PeerID, nil
 }
 
 func (s *Server) resolveStore(r *http.Request) (storesync.SyncStore, error) {
@@ -366,6 +469,9 @@ func (s *Server) clientIP(r *http.Request) string {
 	return ip
 }
 
+// ServeHTTP implements http.Handler with auto-dispatch. It authenticates
+// the request, resolves the store, and routes to the first transport whose
+// CanHandle returns true. For explicit routing, use [Server.Handler] instead.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Rate limit auth failures by IP.
 	ip := s.clientIP(r)
@@ -416,6 +522,121 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.serveTransport(transport, w, r, peerID, store)
+}
+
+// serveWithTransport handles the full request pipeline for a known
+// transport: rate limiting, authentication, store resolution, and
+// transport dispatch. Used by [Server.Handler] for route-based dispatch
+// where the transport is pre-selected rather than auto-detected.
+func (s *Server) serveWithTransport(t Transport, w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	if s.checkAuthRateLimit(ip) {
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
+	peerID, err := s.auth(r)
+	if err != nil {
+		s.recordAuthFailure(ip)
+		if websocket.IsWebSocketUpgrade(r) && s.wsTransport != nil {
+			ws, upgradeErr := s.wsTransport.Upgrader.Upgrade(w, r, nil)
+			if upgradeErr != nil {
+				return
+			}
+			ws.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(CloseCodeAuthFailed, "Unauthorized"))
+			ws.Close()
+			return
+		}
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	store, err := s.resolveStore(r)
+	if err != nil {
+		s.logger.Error("resolveStore error", "err", err)
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	s.serveTransport(t, w, r, peerID, store)
+}
+
+// serverHandler implements [PeerHandler] for the full-sync [Server].
+// It delegates to a [core.SyncStore] for conflict resolution and cursor
+// tracking, and uses a [client.Client] adapter for persistent connection
+// management with event-driven push.
+type serverHandler struct {
+	store   storesync.SyncStore
+	adapter *client.Client
+	logger  *slog.Logger
+}
+
+// HandleMessage processes a single sync exchange by calling SyncStore.Sync
+// to apply incoming items and collect outgoing items. The ack function
+// advances the sync cursor via AckSyncOut.
+func (h *serverHandler) HandleMessage(ctx context.Context, peerID string, msg client.Message) (client.Message, func(), error) {
+	payload := msg.Payload
+	if payload == nil {
+		payload = &storesync.SyncPayload{}
+	}
+
+	response, err := h.store.Sync(ctx, peerID, payload)
+	if err != nil {
+		return client.Message{}, nil, err
+	}
+
+	if response == nil {
+		response = &storesync.SyncPayload{}
+	}
+
+	ack := func() {
+		if err := h.store.AckSyncOut(ctx, peerID, response); err != nil {
+			h.logger.Error("ack sync out error", "peer", peerID, "err", err)
+		}
+	}
+	return client.Message{Type: "sync", Payload: response}, ack, nil
+}
+
+// ServeConnection wraps the connection in a notifyConn and adds it to the
+// client adapter, which runs the sync protocol with event-driven push.
+// Blocks until the connection closes.
+func (h *serverHandler) ServeConnection(peerID string, conn client.Connection) error {
+	nc := &notifyConn{
+		Connection: conn,
+		done:       make(chan struct{}),
+	}
+
+	if err := h.adapter.AddConnection(nc); err != nil {
+		return err
+	}
+
+	<-nc.done
+	return nil
+}
+
+// serveTransport runs connection tracking, hooks, and the transport.
+//
+// For transports implementing [SessionTransport], secondary requests
+// (e.g., SSE POST) bypass connection slot tracking and hooks — they
+// piggyback on the primary stream's connection slot.
+func (s *Server) serveTransport(transport Transport, w http.ResponseWriter, r *http.Request, peerID string, store storesync.SyncStore) {
+	handler := &serverHandler{
+		store:   store,
+		adapter: s.getAdapter(store),
+		logger:  s.logger,
+	}
+
+	// Check if this is a secondary request on an existing session
+	// (e.g. SSE POST). If so, skip connection tracking and hooks.
+	if st, ok := transport.(SessionTransport); ok && st.IsSessionRequest(r, peerID) {
+		if err := transport.Serve(w, r, peerID, handler, s.logger); err != nil {
+			s.logger.Error("transport error", "err", err)
+		}
+		return
+	}
+
 	// Check connection limits.
 	if err := s.acquireConn(peerID); err != nil {
 		s.logger.Warn("connection limit reached", "peer", peerID, "err", err)
@@ -431,8 +652,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	adapter := s.getAdapter(store)
-	if err := transport.Serve(w, r, peerID, store, adapter, s.logger); err != nil {
+	if err := transport.Serve(w, r, peerID, handler, s.logger); err != nil {
 		s.logger.Error("transport error", "err", err)
 	}
 	s.releaseConn(peerID)

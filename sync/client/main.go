@@ -83,9 +83,10 @@ type dialInfo struct {
 // boolean hooks, any hook returning false will suppress the behavior (even
 // if other hooks return true). For error hooks, the first error short-circuits.
 type Client struct {
-	store  storesync.SyncStore
-	logger *slog.Logger
-	dialer Dialer
+	store   storesync.SyncStore
+	logger  *slog.Logger
+	dialer  Dialer
+	dialers map[string]Dialer // scheme -> dialer
 
 	maxConns int
 
@@ -254,7 +255,8 @@ func (c *Client) Connect(peerID, url string, header http.Header) error {
 		}
 		header = h
 	}
-	conn, err := c.dialer(peerID, url, header)
+	dialer, dialURL := c.resolveDialer(url)
+	conn, err := dialer(peerID, dialURL, header)
 	if err != nil {
 		return err
 	}
@@ -396,7 +398,8 @@ func (c *Client) reconnectLoop(di *dialInfo) {
 			}
 		}
 
-		conn, err := c.dialer(di.peerID, di.url, header)
+		dialer, dialURL := c.resolveDialer(di.url)
+		conn, err := dialer(di.peerID, dialURL, header)
 		if err != nil {
 			c.logger.Error("reconnect dial failed", "peer", di.peerID, "err", err)
 			keepRetrying := true

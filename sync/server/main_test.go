@@ -1015,3 +1015,155 @@ func TestServer_OnPeerConnect_MultipleHooks_FirstErrorRejects(t *testing.T) {
 		t.Fatal("second hook should NOT be called after first rejects")
 	}
 }
+
+func TestTokenAuthWithParam_Header(t *testing.T) {
+	tokens := map[string]string{"tok1": "alice"}
+	auth := TokenAuthWithParam("token", tokens)
+
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync", nil)
+	req.Header.Set("Authorization", "Bearer tok1")
+
+	peerID, err := auth(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "alice" {
+		t.Fatalf("expected alice, got %q", peerID)
+	}
+}
+
+func TestTokenAuthWithParam_QueryParam(t *testing.T) {
+	tokens := map[string]string{"tok1": "alice"}
+	auth := TokenAuthWithParam("token", tokens)
+
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync?token=tok1", nil)
+
+	peerID, err := auth(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "alice" {
+		t.Fatalf("expected alice, got %q", peerID)
+	}
+}
+
+func TestTokenAuthWithParam_HeaderTakesPrecedence(t *testing.T) {
+	tokens := map[string]string{
+		"header-tok": "alice",
+		"query-tok":  "bob",
+	}
+	auth := TokenAuthWithParam("token", tokens)
+
+	// Both header and query param present — header wins.
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync?token=query-tok", nil)
+	req.Header.Set("Authorization", "Bearer header-tok")
+
+	peerID, err := auth(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "alice" {
+		t.Fatalf("expected alice (from header), got %q", peerID)
+	}
+}
+
+func TestTokenAuthWithParam_InvalidHeader_NoFallback(t *testing.T) {
+	tokens := map[string]string{"good-tok": "alice"}
+	auth := TokenAuthWithParam("token", tokens)
+
+	// Invalid header token — should fail immediately without checking query param.
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync?token=good-tok", nil)
+	req.Header.Set("Authorization", "Bearer bad-tok")
+
+	_, err := auth(req)
+	if err == nil {
+		t.Fatal("expected error for invalid header token")
+	}
+}
+
+func TestTokenAuthWithParam_NoCredentials(t *testing.T) {
+	tokens := map[string]string{"tok1": "alice"}
+	auth := TokenAuthWithParam("token", tokens)
+
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync", nil)
+
+	_, err := auth(req)
+	if err == nil {
+		t.Fatal("expected error with no credentials")
+	}
+}
+
+func TestTokenAuthWithParam_Integration(t *testing.T) {
+	ss := storesync.New(memory.New(), int64(100*time.Millisecond))
+	tokens := map[string]string{"browser-token": "browser-peer"}
+	srv := New(ss, TokenAuthWithParam("token", tokens))
+	srv.EnableHTTP()
+
+	ctx := context.Background()
+	if err := ss.SetItem(ctx, "app", "param-key", "param-val"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Authenticate via query parameter (no Authorization header).
+	msg := client.Message{Type: "sync", Payload: &storesync.SyncPayload{}}
+	body, _ := json.Marshal(msg)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"?token=browser-token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var respMsg client.Message
+	if err := json.NewDecoder(resp.Body).Decode(&respMsg); err != nil {
+		t.Fatal(err)
+	}
+	if respMsg.Payload == nil || len(respMsg.Payload.Items) < 1 {
+		t.Fatal("expected items in response via query param auth")
+	}
+}
+
+func TestTokenAuthWithExpiryAndParam(t *testing.T) {
+	tokens := map[string]TokenInfo{
+		"valid-tok":   {PeerID: "alice", ExpiresAt: time.Now().Add(1 * time.Hour)},
+		"expired-tok": {PeerID: "bob", ExpiresAt: time.Now().Add(-1 * time.Hour)},
+	}
+	auth := TokenAuthWithExpiryAndParam("token", tokens)
+
+	// Valid token via header.
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/sync", nil)
+	req.Header.Set("Authorization", "Bearer valid-tok")
+	peerID, err := auth(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID != "alice" {
+		t.Fatalf("expected alice, got %q", peerID)
+	}
+
+	// Valid token via query param.
+	req2, _ := http.NewRequest(http.MethodGet, "http://example.com/sync?token=valid-tok", nil)
+	peerID2, err := auth(req2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if peerID2 != "alice" {
+		t.Fatalf("expected alice, got %q", peerID2)
+	}
+
+	// Expired token via query param.
+	req3, _ := http.NewRequest(http.MethodGet, "http://example.com/sync?token=expired-tok", nil)
+	_, err = auth(req3)
+	if err == nil {
+		t.Fatal("expected error for expired token")
+	}
+}
