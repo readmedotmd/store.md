@@ -1,0 +1,8 @@
+# Build artifacts
+client/*.wasm
+server/client/
+server/data/
+
+# Go build cache
+*.exe
+chat
